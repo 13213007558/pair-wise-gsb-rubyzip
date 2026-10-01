@@ -57,6 +57,25 @@ module Zip
     end
   end
 
+  # Error raised when an extraction plan contains conflicts that must be
+  # resolved before extraction can begin. Existing destination conflicts also
+  # remain instances of DestinationExistsError for backwards compatibility.
+  class ExtractionPlanError < DestinationExistsError
+    # The conflicts that prevented extraction.
+    attr_reader :conflicts
+
+    def initialize(conflicts = [])
+      super(conflicts.first&.path)
+      @conflicts = conflicts
+    end
+
+    # The message returned by this error.
+    def message
+      details = @conflicts.map { |conflict| "#{conflict.reason} at #{conflict.target_name}" }
+      "Extraction plan is invalid: #{details.join(', ')}"
+    end
+  end
+
   # Error raised when trying to add an entry to an archive where the
   # entry name already exists.
   class EntryExistsError < Error

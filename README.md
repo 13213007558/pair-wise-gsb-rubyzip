@@ -249,6 +249,21 @@ end
 
 As with `extract`, existing files at the destination will raise `Zip::DestinationExistsError` unless a block is passed to resolve the conflict (see [Existing Files](#existing-files) below). Symlink entries are always skipped (ignored, with a warning), rather than extracted.
 
+To inspect the extraction before it modifies the destination, use
+`Zip::File#extract_plan`. It lists every target and the action that will be
+taken (`create`, `merge`, `overwrite`, or `skip`), along with path traversal,
+case-folding, file/directory, and symlink conflicts. Files are staged before
+the destination is changed, and if execution fails, paths written by this
+extraction are rolled back while pre-existing files are preserved.
+
+```ruby
+Zip::File.open('foo.zip') do |zip_file|
+  plan = zip_file.extract_plan('/path/to/destination')
+  raise plan.message unless plan.valid?
+  plan.execute
+end
+```
+
 ### Reading a Zip file with `Zip::InputStream`
 
 `Zip::InputStream` can be used for faster reading of zip file content because it does not read the Central directory up front.

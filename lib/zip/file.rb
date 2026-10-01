@@ -196,9 +196,9 @@ module Zip
 
       # Extracts every entry in the zip archive `zip_file_name` into
       # `destination_directory`, preserving the archive's directory structure.
-      def extract_all(zip_file_name, destination_directory = '.', &block)
+      def extract_all(zip_file_name, destination_directory = '.', symlinks: :skip, &block)
         Zip::File.open(zip_file_name) do |zf|
-          zf.extract_all(destination_directory, &block)
+          zf.extract_all(destination_directory, symlinks: symlinks, &block)
         end
       end
     end
@@ -365,31 +365,35 @@ module Zip
       found_entry.extract(entry_path, destination_directory: destination_directory, &block)
     end
 
+    # Builds a transactional extraction plan without writing anything to the
+    # destination. The plan lists every target path, whether Rubyzip will
+    # create, merge, overwrite, or skip it, and every path or type conflict.
+    #
+    # Pass a block to permit overwriting an existing regular file or symlink.
+    # Existing directories are merged with directory entries and never cause
+    # their contents to be deleted. `symlinks: :raise` treats archive symlink
+    # entries as conflicts; the default `symlinks: :skip` skips them.
+    #
+    # Call `#execute` on the returned plan after reviewing it. Execution stages
+    # every file before replacing anything in the destination, rechecks the
+    # required path conditions, and rolls back changes made by this extraction
+    # if it fails.
+    def extract_plan(destination_directory = '.', symlinks: :skip, &block)
+      entries.each { |entry| apply_restore_options(entry) }
+      ExtractionPlan.new(entries, destination_directory, symlinks: symlinks, &block)
+    end
+
     # Extracts every entry in the archive into `destination_directory`,
     # preserving the archive's directory structure.
     #
-    # Symlink entries are ignored (skipped, with a warning) rather than
-    # extracted. See `Entry#extract` for the path-safety checks applied to
-    # every other entry.
-    #
-    # NB: The caller is responsible for making sure `destination_directory` is
-    # safe, if it is passed.
-    def extract_all(destination_directory = '.', &block)
-      # Partition the entries into directories and non-directories, so that
-      # directories are created first.
-      dirs, others = entries.partition(&:directory?)
-
-      (dirs + others).each do |entry|
-        if entry.symlink?
-          warn "WARNING: skipped symlink '#{entry.name}' during extract_all."
-          next
-        end
-
-        apply_restore_options(entry)
-        entry.extract(entry.name, destination_directory:     destination_directory,
-                                  create_parent_directories: true, &block)
-      end
-
+    # All entries are planned before anything is written. Existing files raise
+    # unless the supplied block permits overwriting them. Symlink entries are
+    # skipped by default; use #extract_plan with `symlinks: :raise` to reject
+    # archives that contain them. Failed extraction rolls back paths created or
+    # replaced by this operation, while pre-existing destination files remain
+    # unchanged.
+    def extract_all(destination_directory = '.', symlinks: :skip, &block)
+      extract_plan(destination_directory, symlinks: symlinks, &block).execute
       self
     end
 
