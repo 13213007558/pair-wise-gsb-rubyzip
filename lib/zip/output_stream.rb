@@ -29,17 +29,46 @@ module Zip
 
     # Opens the indicated zip file. If a file with that name already
     # exists it will be overwritten.
-    def initialize(file_name, stream: false, encrypter: nil, suppress_extra_fields: false, **opts)
+    #
+    # When +unidirectional+ is true the archive is written straight to
+    # +file_name+ in one direction only: the target only has to support
+    # writing (no +seek+ or +pos=+ is ever called on it). In this mode every
+    # local file header is written with zero CRC/size fields and the
+    # general-purpose "data descriptor" flag set; the real values follow in
+    # a data descriptor after each entry's data, and the central directory
+    # is written when the stream is closed. This makes it possible to
+    # stream zip archives to write-only sinks such as HTTP response bodies.
+    # The target IO is *not* closed by {#close} (only flushed, if it
+    # supports that), since the caller owns it.
+    def initialize(file_name, stream: false, encrypter: nil, suppress_extra_fields: false,
+                   unidirectional: false, **opts)
       super(**opts)
       @file_name = file_name
-      @output_stream = if stream
-                         iostream = Zip::RUNNING_ON_WINDOWS ? @file_name : @file_name.dup
-                         iostream.reopen(@file_name)
-                         iostream.rewind
-                         iostream
-                       else
-                         ::File.new(@file_name, 'wb')
-                       end
+      @unidirectional = unidirectional
+      if @unidirectional
+        unless @file_name.respond_to?(:write)
+          raise ArgumentError, 'unidirectional mode requires an IO object'
+        end
+
+        @file_name.binmode if @file_name.respond_to?(:binmode)
+        # Use the target directly when it can report its own position via
+        # #tell (for example a counting IO simulating a large offset).
+        # Otherwise wrap it in a byte counter; in either case nothing is
+        # ever seeked or repositioned on the target.
+        @output_stream =
+          if @file_name.respond_to?(:tell)
+            @file_name
+          else
+            WriteOnlyCountingIO.new(@file_name)
+          end
+      elsif stream
+        iostream = Zip::RUNNING_ON_WINDOWS ? @file_name : @file_name.dup
+        iostream.reopen(@file_name)
+        iostream.rewind
+        @output_stream = iostream
+      else
+        @output_stream = ::File.new(@file_name, 'wb')
+      end
       @cdir = ::Zip::CentralDirectory.new
       @compressor = ::Zip::NullCompressor.instance
       @encrypter = encrypter || ::Zip::NullEncrypter.new
@@ -77,16 +106,44 @@ module Zip
         yield zos
         zos.close_buffer
       end
+
+      # Opens a unidirectional zip stream that writes to +io+ without ever
+      # seeking on it. +io+ only needs to respond to +write+ (+binmode+ and
+      # +flush+ are used if available). Local headers use data descriptors
+      # and the central directory is appended on close. The underlying +io+
+      # is not closed. If a block is given it is yielded the stream and the
+      # archive is finalized when the block returns; otherwise the stream
+      # itself is returned and must be closed with #close.
+      #
+      #   Zip::OutputStream.write_stream(response.stream) do |zos|
+      #     zos.put_next_entry('report.txt')
+      #     zos.write(report_body)
+      #   end
+      def write_stream(io = nil, encrypter: nil, suppress_extra_fields: false, **opts)
+        zos = new(io, unidirectional: true, encrypter: encrypter,
+                  suppress_extra_fields: suppress_extra_fields, **opts)
+        return zos unless block_given?
+
+        begin
+          yield zos
+        ensure
+          zos.close if zos
+        end
+      end
     end
 
-    # Closes the stream and writes the central directory to the zip file
+    # Closes the stream and writes the central directory to the zip file.
+    #
+    # In unidirectional mode the underlying IO is not closed (it is only
+    # flushed when it responds to +flush+); the caller owns it.
     def close
       return if @closed
 
       finalize_current_entry
-      update_local_headers
-      @cdir.write_to_stream(@output_stream, suppress_extra_fields: @suppress_extra_fields)
-      @output_stream.close
+      write_central_directory
+      unless @unidirectional
+        @output_stream.close
+      end
       @closed = true
     end
 
@@ -95,8 +152,7 @@ module Zip
       return @output_stream if @closed
 
       finalize_current_entry
-      update_local_headers
-      @cdir.write_to_stream(@output_stream, suppress_extra_fields: @suppress_extra_fields)
+      write_central_directory
       @closed = true
       @output_stream.flush
       @output_stream
@@ -150,32 +206,104 @@ module Zip
 
     private
 
+    def write_central_directory
+      unless @unidirectional
+        update_local_headers
+      end
+      @cdir.write_to_stream(@output_stream, suppress_extra_fields: @suppress_extra_fields)
+      @output_stream.flush if @unidirectional && @output_stream.respond_to?(:flush)
+    end
+
     def finalize_current_entry
       return unless @current_entry
 
+      if @unidirectional
+        finalize_unidirectional_entry
+      else
+        finish
+        @output_stream << @encrypter.trailer unless @current_entry.directory?
+        @current_entry.compressed_size = @output_stream.tell -
+                                         @current_entry.local_header_offset -
+                                         @current_entry.calculate_local_header_size
+        @current_entry.size = @compressor.size
+        @current_entry.crc = @encrypter.crc(@compressor.crc)
+        @output_stream << @encrypter.data_descriptor(
+          @current_entry.crc,
+          @current_entry.compressed_size,
+          @current_entry.size
+        )
+        @current_entry.gp_flags |= @encrypter.gp_flags unless @current_entry.directory?
+        @current_entry = nil
+        @compressor = ::Zip::NullCompressor.instance
+      end
+    end
+
+    # Finalize the current entry when writing to a non-seekable stream. The
+    # CRC and sizes are only known now, so they are written to a data
+    # descriptor that follows the entry data. The local header's Zip64
+    # placeholder (if any) is dropped unless the final sizes really need it,
+    # since the central directory entry records the authoritative sizes.
+    def finalize_unidirectional_entry
+      entry = @current_entry
+      used_zip64 = entry.local_header_uses_zip64
+
       finish
-      @output_stream << @encrypter.trailer unless @current_entry.directory?
-      @current_entry.compressed_size = @output_stream.tell -
-                                       @current_entry.local_header_offset -
-                                       @current_entry.calculate_local_header_size
-      @current_entry.size = @compressor.size
-      @current_entry.crc = @encrypter.crc(@compressor.crc)
-      @output_stream << @encrypter.data_descriptor(
-        @current_entry.crc,
-        @current_entry.compressed_size,
-        @current_entry.size
-      )
-      @current_entry.gp_flags |= @encrypter.gp_flags unless @current_entry.directory?
+      @output_stream << @encrypter.trailer unless entry.directory?
+
+      entry.compressed_size = @output_stream.tell -
+                              entry.local_header_offset -
+                              entry.local_header_size
+      entry.size = @compressor.size
+      entry.crc = @encrypter.crc(@compressor.crc)
+
+      unless Zip.write_zip64_support ||
+             (entry.size < 0xFFFFFFFF && entry.compressed_size < 0xFFFFFFFF)
+        raise Error,
+              "entry '#{entry.name}' exceeds the 32-bit limit but Zip64 support is disabled"
+      end
+
+      @output_stream << streaming_data_descriptor(entry, used_zip64)
+      entry.gp_flags |= @encrypter.gp_flags unless entry.directory?
+
+      # A Zip64 placeholder was written speculatively in the local header.
+      # The central directory entry is authoritative and re-adds the extra
+      # field only for sizes (or the header offset) that genuinely need it,
+      # so drop the stale local placeholder here.
+      entry.extra.delete(:zip64) unless
+        entry.size >= 0xFFFFFFFF || entry.compressed_size >= 0xFFFFFFFF
+
       @current_entry = nil
       @compressor = ::Zip::NullCompressor.instance
+    end
+
+    # Build the data descriptor for an entry written to a non-seekable
+    # stream. When the local header carried a Zip64 placeholder the
+    # descriptor uses 64-bit size fields (per the ZIP format spec);
+    # otherwise it is the regular 32-bit form. Both forms start with the
+    # optional, but unambiguous, data descriptor signature.
+    def streaming_data_descriptor(entry, used_zip64)
+      # Signature and CRC are explicit V fields before the size fields: a
+      # leading V directly followed by Q directives is packed incorrectly by
+      # some Ruby versions, whereas VV followed by the size fields is
+      # reliable everywhere.
+      fields = [DATA_DESCRIPTOR_SIGNATURE, entry.crc,
+                entry.compressed_size, entry.size]
+      fields.pack(used_zip64 ? 'VVQ<Q<' : 'VVVV')
     end
 
     def init_next_entry(entry)
       finalize_current_entry
       check_duplicate_name(entry, 'put_next_entry')
       @encrypter.prepare_entry(entry)
+      if @unidirectional
+        entry.gp_flags |= GP_FLAG_DATA_DESCRIPTOR
+      end
       @cdir << entry
-      entry.write_local_entry(@output_stream, suppress_extra_fields: @suppress_extra_fields)
+      entry.write_local_entry(
+        @output_stream,
+        suppress_extra_fields: @suppress_extra_fields,
+        streaming:             @unidirectional
+      )
       @encrypter.reset!
       @output_stream << @encrypter.header(entry.mtime) unless entry.directory?
       @compressor = get_compressor(entry)
@@ -221,6 +349,40 @@ module Zip
     def <<(data)
       @compressor << data
       self
+    end
+
+    # Internal wrapper around a write-only target used in unidirectional
+    # mode when the target cannot report its own position. It forwards the
+    # bytes straight through and keeps a running count of how many have been
+    # written (so header offsets are known), and deliberately offers no
+    # positioning methods at all.
+    class WriteOnlyCountingIO
+      attr_reader :pos
+
+      def initialize(target)
+        @target = target
+        @pos = 0
+      end
+
+      alias tell pos
+
+      def write(data)
+        bytes = data.to_s
+        @target.write(bytes)
+        @pos += bytes.bytesize
+        bytes.bytesize
+      end
+
+      alias << write
+
+      def binmode
+        @target.binmode if @target.respond_to?(:binmode)
+        self
+      end
+
+      def flush
+        @target.flush if @target.respond_to?(:flush)
+      end
     end
   end
 end

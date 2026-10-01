@@ -96,6 +96,40 @@ end
 
 You can generate a Zip archive in memory using `Zip::OutputStream.write_buffer`.
 
+### Writing a Zip straight to a non-seekable stream
+
+Sometimes the destination cannot be rewound or positioned at all — for
+example an HTTP response body, a pipe or a write-only socket. In that case
+the local file headers cannot be patched after the entry data is written.
+Use `Zip::OutputStream.write_stream` (or construct an `OutputStream` with
+`unidirectional: true`) instead. The target only has to respond to
+`write`; it is never seeked, the archive is not buffered anywhere, and the
+central directory is appended when the stream is closed.
+
+Each local file header is written with the "data descriptor" general
+purpose flag set and zero CRC/size fields; the real CRC and sizes follow in
+a [data descriptor](https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT)
+immediately after the entry data. Both stored and deflated entries (and
+empty entries/directories) are supported. The underlying IO is **not**
+closed when the zip stream is closed (it is flushed if it responds to
+`flush`), since the caller owns it.
+
+```ruby
+# e.g. in a Rack/Rails controller
+Zip::OutputStream.write_stream(response.stream) do |zos|
+  zos.put_next_entry('first.txt')
+  zos.write(first_body)
+
+  zos.put_next_entry('second.txt', '', Zip::ExtraField.new, Zip::Entry::STORED)
+  second_body.each_chunk { |chunk| zos.write(chunk) } # content may arrive in chunks
+end
+```
+
+Because the entry sizes are usually not known in advance, a streaming
+write uses the Zip64 form for the local headers and data descriptors
+whenever `Zip.write_zip64_support` is enabled (the default). Entries with a
+known size below the 32-bit limit use plain 32-bit headers.
+
 ### Suppressing extra fields
 
 If you wish to suppress extra fields from being added to your entries, you can do so by passing the `suppress_extra_fields` parameter to any of the archive opening calls within `Zip::File` or `Zip::OutputStream`, e.g.:

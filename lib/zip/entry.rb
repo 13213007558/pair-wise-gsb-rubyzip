@@ -29,7 +29,13 @@ module Zip
                   :unix_gid, :unix_perms, :unix_uid
 
     attr_accessor :crc, :external_file_attributes, :fstype, :gp_flags,
-                  :internal_file_attributes, :local_header_offset # :nodoc:
+                  :internal_file_attributes, :local_header_offset,
+                  :local_header_size # :nodoc:
+
+    # Whether the most recently written local file header used the Zip64
+    # size markers. This determines the width of the following data
+    # descriptor when writing to a non-seekable stream.
+    attr_reader :local_header_uses_zip64 # :nodoc:
 
     attr_reader :extra, :compression_level, :filepath # :nodoc:
 
@@ -42,6 +48,7 @@ module Zip
     def set_default_vars_values # :nodoc:
       @local_header_offset      = 0
       @local_header_size        = nil # not known until local entry is created or read
+      @local_header_uses_zip64  = false
       @internal_file_attributes = 1
       @external_file_attributes = 0
       @header_signature         = ::Zip::CENTRAL_DIRECTORY_ENTRY_SIGNATURE
@@ -432,20 +439,50 @@ module Zip
        @extra ? @extra.local_size : 0].pack('VvvvvvVVVvv')
     end
 
-    def write_local_entry(io, suppress_extra_fields: false, rewrite: false) # :nodoc:
-      prep_local_zip64_extra
+    # Pack a local file header for an entry that is being written to a
+    # non-seekable stream. The CRC and both sizes are unknown at this point,
+    # so they are left zero and are supplied afterwards by a data
+    # descriptor (see Zip::OutputStream). If a Zip64 extra field is present
+    # then its placeholder values are zero as well, and the 32-bit size
+    # fields are set to 0xFFFFFFFF.
+    def pack_streaming_local_entry # :nodoc:
+      zip64 = @extra[:zip64]
+      [::Zip::LOCAL_ENTRY_SIGNATURE,
+       @version_needed_to_extract, # version needed to extract
+       @gp_flags, # @gp_flags
+       stored_compression_method,
+       @time.to_binary_dos_time, # @last_mod_time
+       @time.to_binary_dos_date, # @last_mod_date
+       0, # crc32: follows in the data descriptor
+       zip64 ? 0xFFFFFFFF : 0, # compressed size
+       zip64 ? 0xFFFFFFFF : 0, # uncompressed size
+       name_size,
+       @extra ? @extra.local_size : 0].pack('VvvvvvVVVvv')
+    end
 
-      # If we are rewriting the local header, then we verify that we haven't changed
-      # its size. At this point we have to keep extra fields if they are present.
-      if rewrite
-        verify_local_header_size!
-      elsif suppress_extra_fields
-        @extra.suppress_fields!(suppress_extra_fields)
+    def write_local_entry(io, suppress_extra_fields: false, rewrite: false,
+                          streaming: false) # :nodoc:
+      if streaming
+        prep_streaming_local_zip64_extra
+        # The data descriptor written after the entry data must use 64-bit
+        # size fields when this local header carries Zip64 size markers.
+        @local_header_uses_zip64 = zip64?
+        @extra.suppress_fields!(suppress_extra_fields) if suppress_extra_fields
+      else
+        prep_local_zip64_extra
+
+        # If we are rewriting the local header, then we verify that we haven't changed
+        # its size. At this point we have to keep extra fields if they are present.
+        if rewrite
+          verify_local_header_size!
+        elsif suppress_extra_fields
+          @extra.suppress_fields!(suppress_extra_fields)
+        end
       end
 
       @local_header_offset = io.tell
 
-      io << pack_local_entry
+      io << (streaming ? pack_streaming_local_entry : pack_local_entry)
 
       io << @name
       io << @extra.to_local_bin if @extra
@@ -828,7 +865,14 @@ module Zip
       return unless zip64?
 
       if for_local_header
-        @size, @compressed_size = @extra[:zip64].parse(@size, @compressed_size)
+        # A Zip64 extra field in a local header only carries data for fields
+        # whose base value is the 0xFFFFFFFF marker (see the APPNOTE). The
+        # streaming writer leaves a zeroed placeholder next to valid (zero or
+        # otherwise) base values, so only marked fields are taken from it;
+        # otherwise the base values are authoritative.
+        parsed_size, parsed_csize = @extra[:zip64].parse(@size, @compressed_size)
+        @size = @size == 0xFFFFFFFF ? parsed_size : @size
+        @compressed_size = @compressed_size == 0xFFFFFFFF ? parsed_csize : @compressed_size
       else
         @size, @compressed_size, @local_header_offset = @extra[:zip64].parse(
           @size, @compressed_size, @local_header_offset
@@ -894,6 +938,40 @@ module Zip
         zip64.original_size = @size || 0
         zip64.compressed_size = @compressed_size
       end
+    end
+
+    # Prepare a Zip64 extra field for a local header that is written before
+    # the entry's data (the non-seekable streaming case). The values in the
+    # local header are placeholders; the real ones follow in the data
+    # descriptor and the central directory entry.
+    #
+    # The policy is deterministic:
+    # - a known size below the 32-bit limit never uses Zip64 locally;
+    # - an unknown size uses plain 32-bit zeroed fields when Zip64 support
+    #   is disabled (finalization raises if the data then reaches the
+    #   32-bit limit), or a Zip64 placeholder when it is enabled;
+    # - a known size at/above the limit requires Zip64 and raises
+    #   immediately otherwise, since the header cannot be patched later.
+    def prep_streaming_local_zip64_extra # :nodoc:
+      return unless file?
+      return if @size && @size < 0xFFFFFFFF
+
+      if @size.nil?
+        # The size is only learned as data is written. Without Zip64 we
+        # emit plain zeroed fields; finalize_unidirectional_entry raises if
+        # the actual size reaches the 32-bit limit.
+        return unless ::Zip.write_zip64_support
+      elsif !::Zip.write_zip64_support
+        raise Error,
+              "cannot stream entry '#{@name}': its size reaches the 32-bit " \
+              'limit, but Zip64 support is disabled'
+      end
+
+      @version_needed_to_extract =
+        [@version_needed_to_extract, VERSION_NEEDED_TO_EXTRACT_ZIP64].max
+      zip64 = @extra[:zip64] || @extra.create(:zip64)
+      zip64.original_size = 0
+      zip64.compressed_size = 0
     end
 
     def prep_cdir_zip64_extra
