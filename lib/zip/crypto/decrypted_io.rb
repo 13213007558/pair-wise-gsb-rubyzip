@@ -15,18 +15,11 @@ module Zip
     end
 
     def read(maxlen = nil)
+      @buffer << produce_input while !input_finished? && (maxlen.nil? || @buffer.bytesize < maxlen)
+
+      verify_integrity if input_finished?
+
       return (maxlen.nil? || maxlen.zero? ? '' : nil) if eof?
-
-      while maxlen.nil? || (@buffer.bytesize < maxlen)
-        break if input_finished?
-
-        @buffer << produce_input
-      end
-
-      if input_finished? && !@integrity_verified
-        @decrypter.check_integrity!(@io)
-        @integrity_verified = true
-      end
 
       @buffer.slice!(0...(maxlen || @buffer.bytesize))
     end
@@ -41,12 +34,38 @@ module Zip
       !@bytes_remaining.positive?
     end
 
+    # Integrity is checked exactly once, as soon as the input has finished -
+    # even for empty entries, and even if read is called again afterwards.
+    def verify_integrity
+      return if @integrity_verified
+
+      @decrypter.check_integrity!(@io)
+      @integrity_verified = true
+    end
+
     def produce_input
       chunk_size = [@bytes_remaining, CHUNK_SIZE].min
       return '' unless chunk_size.positive?
 
-      @bytes_remaining -= chunk_size
-      @decrypter.decrypt(@io.read(chunk_size))
+      data = read_fully(chunk_size)
+      @bytes_remaining -= data.bytesize
+      @decrypter.decrypt(data)
+    end
+
+    # Reads exactly `length` bytes from the underlying IO, looping over any
+    # short reads it returns. Never reads past the entry's ciphertext, so
+    # the trailing authentication code is left untouched for
+    # `check_integrity!`. A truncated entry is an error, not a normal end
+    # of input.
+    def read_fully(length)
+      data = +''.b
+      while data.bytesize < length
+        chunk = @io.read(length - data.bytesize)
+        raise ::Zip::Error, 'Truncated encrypted data' if chunk.nil? || chunk.empty?
+
+        data << chunk
+      end
+      data
     end
   end
 end

@@ -281,4 +281,52 @@ class EncryptionTest < Minitest::Test
       assert_equal ::File.read("#{DATA_DIR}/#{INPUT_FILE5}"), zis.read
     end
   end
+
+  # Reads the stream in small chunks that are not aligned with the 16-byte
+  # AES cipher blocks. The decrypted content must not depend on how the
+  # reads happen to be chunked.
+  def test_aes_256_decrypt_in_chunks_with_rewind
+    Zip::InputStream.open(
+      "#{DATA_DIR}/#{AES_256_ZIP_TEST_FILE}",
+      decrypter: Zip::AESDecrypter.new('password', Zip::AESEncryption::STRENGTH_256_BIT)
+    ) do |zis|
+      [INPUT_FILE3, INPUT_FILE4].each do |entry_name|
+        entry = zis.get_next_entry
+        assert entry
+        assert_equal entry_name, entry.name
+
+        expected = ::File.read("#{DATA_DIR}/#{entry_name}")
+
+        decrypted = +''.b
+        while (chunk = zis.read(7))
+          decrypted << chunk
+        end
+        assert_equal expected, decrypted
+
+        # Reading again at EOF keeps returning nil.
+        assert_nil zis.read(7)
+
+        # Rewinding and re-reading gives the same content again.
+        zis.rewind
+        assert_equal expected, zis.read
+      end
+    end
+  end
+
+  def test_aes_decrypt_keka_in_chunks
+    Zip::InputStream.open(
+      "#{DATA_DIR}/#{AES_KEKA_ZIP_TEST_FILE}",
+      decrypter: Zip::AESDecrypter.new('swordfish', Zip::AESEncryption::STRENGTH_256_BIT)
+    ) do |zis|
+      entry = zis.get_next_entry
+      assert_equal INPUT_FILE2, entry.name
+
+      expected = ::File.read("#{DATA_DIR}/#{INPUT_FILE2}")
+      decrypted = +''.b
+      while (chunk = zis.read(7))
+        decrypted << chunk
+      end
+      assert_equal expected, decrypted
+    end
+  end
 end

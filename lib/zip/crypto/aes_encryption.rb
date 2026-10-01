@@ -168,21 +168,35 @@ module Zip
   class AESDecrypter < Decrypter # :nodoc:
     include AESEncryption
 
+    # `DecryptedIo` (and any other caller) may feed this ciphertext in
+    # arbitrarily sized chunks that need not align with the 16-byte cipher
+    # blocks - e.g. when the underlying IO returns short reads. The CTR
+    # counter must stay aligned with the true byte offset in the ciphertext
+    # stream, so `@block_offset` tracks how many bytes of the current
+    # block's keystream have already been consumed. This keeps the output
+    # identical no matter how the caller chunks its reads.
     def decrypt(encrypted_data)
       @hmac.update(encrypted_data)
 
-      idx = 0
       decrypted_data = +''
-      amount_to_read = encrypted_data.size
+      offset = 0
 
-      while amount_to_read.positive?
+      while offset < encrypted_data.bytesize
         @cipher.iv = [@counter + 1].pack('Vx12')
-        begin_index = BLOCK_SIZE * idx
-        end_index = begin_index + [BLOCK_SIZE, amount_to_read].min
-        decrypted_data << @cipher.update(encrypted_data[begin_index...end_index])
-        amount_to_read -= BLOCK_SIZE
+        # Re-setting the IV restarts the block's keystream, so skip past
+        # any keystream bytes already consumed by a previous chunk that
+        # ended mid-block.
+        @cipher.update("\0" * @block_offset) if @block_offset.positive?
+
+        chunk = encrypted_data[offset, BLOCK_SIZE - @block_offset]
+        decrypted_data << @cipher.update(chunk)
+        offset += chunk.bytesize
+        @block_offset += chunk.bytesize
+
+        next unless @block_offset == BLOCK_SIZE
+
+        @block_offset = 0
         @counter += 1
-        idx += 1
       end
 
       # JRuby requires finalization of the cipher. This is a bug, as noted in
@@ -199,6 +213,7 @@ module Zip
       raise Error, 'Bad password' if enc_pwd_verify != pwd_verify
 
       @counter = 0
+      @block_offset = 0
       @cipher = OpenSSL::Cipher::AES.new(@bits, :CTR)
       @cipher.decrypt
       @cipher.key = enc_key
@@ -206,7 +221,13 @@ module Zip
     end
 
     def check_integrity!(io)
-      auth_code = io.read(AUTHENTICATION_CODE_LENGTH)
+      auth_code = +''.b
+      while auth_code.bytesize < AUTHENTICATION_CODE_LENGTH
+        chunk = io.read(AUTHENTICATION_CODE_LENGTH - auth_code.bytesize)
+        break if chunk.nil? || chunk.empty?
+
+        auth_code << chunk
+      end
       raise Error, 'Integrity fault' if @hmac.digest[0...AUTHENTICATION_CODE_LENGTH] != auth_code
     end
   end

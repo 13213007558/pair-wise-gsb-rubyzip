@@ -40,6 +40,82 @@ class AESDecrypterTest < Minitest::Test
   end
 end
 
+# The CTR counter must stay aligned with the true byte offset in the
+# ciphertext stream, so the plaintext produced by `decrypt` must not depend
+# on how the caller happens to chunk the ciphertext it feeds in.
+class AESDecrypterChunkingTest < Minitest::Test
+  PASSWORD = 'password'
+  STRENGTHS = [
+    Zip::AESEncryption::STRENGTH_128_BIT,
+    Zip::AESEncryption::STRENGTH_192_BIT,
+    Zip::AESEncryption::STRENGTH_256_BIT
+  ].freeze
+
+  def setup
+    # 1003 bytes: spans many 16-byte cipher blocks and ends with a final
+    # partial block of 11 bytes.
+    @plaintext = SecureRandom.random_bytes(1003)
+  end
+
+  def encrypt(strength)
+    encrypter = Zip::AESEncrypter.new(PASSWORD, strength)
+    encrypter.reset!
+    header = encrypter.header('ignored')
+    ciphertext = encrypter.encrypt(@plaintext)
+    trailer = encrypter.trailer
+    ciphertext << trailer[0...-Zip::AESEncryption::AUTHENTICATION_CODE_LENGTH]
+    auth_code = trailer[-Zip::AESEncryption::AUTHENTICATION_CODE_LENGTH..]
+    [header, ciphertext, auth_code]
+  end
+
+  def decrypt_chunked(header, ciphertext, chunk_sizes, strength)
+    decrypter = Zip::AESDecrypter.new(PASSWORD, strength)
+    decrypter.reset!(header)
+    decrypted = +''.b
+    pos = 0
+    chunk_sizes.cycle do |size|
+      break if pos >= ciphertext.bytesize
+
+      decrypted << decrypter.decrypt(ciphertext[pos, size])
+      pos += size
+    end
+    [decrypter, decrypted]
+  end
+
+  def test_decrypt_in_chunks_matches_whole_ciphertext_decrypt
+    STRENGTHS.each do |strength|
+      header, ciphertext, auth_code = encrypt(strength)
+
+      whole_decrypter = Zip::AESDecrypter.new(PASSWORD, strength)
+      whole_decrypter.reset!(header)
+      whole = whole_decrypter.decrypt(ciphertext.dup)
+      whole_decrypter.check_integrity!(StringIO.new(auth_code))
+      assert_equal @plaintext, whole
+
+      # Fixed chunk sizes (1, 7, 16 and 31 bytes) and alternating lengths,
+      # deliberately crossing 16-byte block boundaries.
+      [[1], [7], [16], [31], [1, 16, 7, 31, 5]].each do |chunk_sizes|
+        decrypter, decrypted = decrypt_chunked(header, ciphertext, chunk_sizes, strength)
+        decrypter.check_integrity!(StringIO.new(auth_code))
+
+        assert_equal whole, decrypted,
+                     "chunk sizes #{chunk_sizes.inspect} (AES-#{Zip::AESEncryption::BITS[strength]})"
+      end
+    end
+  end
+
+  def test_tampered_ciphertext_fails_integrity_check_when_read_in_chunks
+    header, ciphertext, auth_code = encrypt(Zip::AESEncryption::STRENGTH_256_BIT)
+
+    tampered = ciphertext.dup
+    tampered.setbyte(17, tampered.getbyte(17) ^ 0xFF)
+
+    decrypter, = decrypt_chunked(header, tampered, [7], Zip::AESEncryption::STRENGTH_256_BIT)
+    error = assert_raises(Zip::Error) { decrypter.check_integrity!(StringIO.new(auth_code)) }
+    assert_equal 'Integrity fault', error.message
+  end
+end
+
 class AESEncrypterTest < Minitest::Test
   STRENGTHS = [
     Zip::AESEncryption::STRENGTH_128_BIT,
