@@ -271,6 +271,35 @@ end # The `InputStream` is closed at the end of the block.
 
 Any attempt to move about in a zip file opened with `Zip::InputStream` could result in the incorrect entry being accessed and/or Zlib buffer errors. If you need random access in a zip file, use `Zip::File`.
 
+### Reading split (multi-volume) Zip files
+
+Split or spanned archives, whose data is stored across several volumes (for example `archive.z01`, `archive.z02`, ..., `archive.zip`), can be read with `Zip::MultiVolumeFile` without first concatenating the volumes into a single file. It offers the same read-only interface as `Zip::File` (`entries`, `find_entry`, `get_input_stream`, `read`, `extract`, ...), but the archive cannot be modified.
+
+Volumes are numbered from 0, following the "number of this disk" scheme of the zip format, and are supplied as a hash of disk number to seekable IO:
+
+```ruby
+disks = { 0 => File.open('archive.z01', 'rb'),
+          1 => File.open('archive.zip', 'rb') }
+begin
+  Zip::MultiVolumeFile.open(disks) do |zip_file|
+    puts zip_file.read('hello.txt')
+  end
+ensure
+  disks.each_value(&:close)
+end
+```
+
+Alternatively, volumes can be opened lazily through `Zip::MultiVolumeIo` and an opener block, which is called the first time each disk is actually needed. That way, reading a single entry only opens the volumes that entry (and the central directory) live on:
+
+```ruby
+io = Zip::MultiVolumeIo.new(2) do |disk_number|
+  File.open(format('archive.z%02d', disk_number + 1), 'rb')
+end
+Zip::MultiVolumeFile.open(io) { |zip_file| ... }
+```
+
+`Zip::MultiVolumeFile` and `Zip::MultiVolumeIo` never close the IO objects they are given or obtain from the opener block; closing them remains the caller's responsibility. Missing or mismatched volumes and records truncated at a volume boundary are reported as `Zip::MultiVolumeError` (or its subclass `Zip::MissingDiskError`), which carries the disk number and, where relevant, the offset within that disk.
+
 ### Encryption and Password Protection (experimental)
 
 Rubyzip supports reading and writing zip files with AES encryption (reading: version 3.1 and later; writing: version 3.7 and later), and reading and writing zip files with traditional zip encryption (a.k.a. "ZipCrypto"). Encryption is currently only available with the stream API, with either files or buffers, e.g.:

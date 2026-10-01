@@ -134,6 +134,41 @@ module Zip
     end
   end
 
+  # Error raised when there is a problem reading a multi-volume (split or
+  # spanned) archive: a required volume is missing, the volumes provided do
+  # not match the archive, or a record is truncated at a volume boundary.
+  class MultiVolumeError < Error
+    # The number of the disk (volume) on which the problem was encountered,
+    # if known. Disks are numbered from 0.
+    attr_reader :disk_number
+
+    # The offset within that disk at which the problem was encountered, if
+    # known.
+    attr_reader :disk_offset
+
+    # Create a new MultiVolumeError. +disk_number+ and +disk_offset+ locate
+    # the problem within the archive's volumes.
+    def initialize(message, disk_number: nil, disk_offset: nil)
+      super(message)
+      @disk_number = disk_number
+      @disk_offset = disk_offset
+    end
+  end
+
+  # Error raised when a multi-volume archive references a disk (volume) that
+  # the caller has not provided.
+  class MissingDiskError < MultiVolumeError
+    # Create a new MissingDiskError for +disk_number+, optionally with the
+    # offset within that disk at which data was needed and the number of
+    # disks that were provided.
+    def initialize(disk_number, disk_offset: nil, provided_count: nil)
+      message = +"Archive requires disk #{disk_number}"
+      message << " (at offset #{disk_offset})" if disk_offset
+      message << ", but only #{provided_count} disk(s) were provided" if provided_count
+      super(message, disk_number: disk_number, disk_offset: disk_offset)
+    end
+  end
+
   # Error raised if there is not enough metadata for the entry to be streamed.
   class StreamingError < Error
     # The entry that has caused this error.

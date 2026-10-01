@@ -31,6 +31,11 @@ module Zip
     attr_accessor :crc, :external_file_attributes, :fstype, :gp_flags,
                   :internal_file_attributes, :local_header_offset # :nodoc:
 
+    # The number of the disk on which this entry's local header starts, for
+    # multi-volume (split or spanned) archives. Always 0 for normal
+    # single-file archives.
+    attr_accessor :disk_number_start
+
     attr_reader :extra, :compression_level, :filepath # :nodoc:
 
     attr_writer :size # :nodoc:
@@ -41,6 +46,7 @@ module Zip
 
     def set_default_vars_values # :nodoc:
       @local_header_offset      = 0
+      @disk_number_start        = 0
       @local_header_size        = nil # not known until local entry is created or read
       @internal_file_attributes = 1
       @external_file_attributes = 0
@@ -343,6 +349,8 @@ module Zip
         entry = new(path)
         entry.read_c_dir_entry(io)
         entry
+      rescue MultiVolumeError
+        raise
       rescue Error
         nil
       end
@@ -351,7 +359,7 @@ module Zip
         entry = new(io)
         entry.read_local_entry(io)
         entry
-      rescue SplitArchiveError
+      rescue SplitArchiveError, MultiVolumeError
         raise
       rescue Error
         nil
@@ -467,7 +475,7 @@ module Zip
         @name_length,
         @extra_length,
         @comment_length,
-        _, # diskNumberStart
+        @disk_number_start,
         @internal_file_attributes,
         @external_file_attributes,
         @local_header_offset = buf.unpack('VCCvvvvvVVVvvvvvVV')
@@ -683,7 +691,7 @@ module Zip
           raise "unknown @file_type #{ftype}"
         end
       else
-        zis = ::Zip::InputStream.new(@zipfile, offset: local_header_offset, decrypter: decrypter)
+        zis = ::Zip::InputStream.new(@zipfile, offset: input_stream_offset, decrypter: decrypter)
         zis.instance_variable_set(:@complete_entry, self)
         zis.get_next_entry
         if block
@@ -696,6 +704,18 @@ module Zip
           zis
         end
       end
+    end
+
+    # The offset at which an InputStream should be positioned to read this
+    # entry. For entries read from a multi-volume archive this is a
+    # Zip::MultiVolumeIo::Position (disk number plus offset within that
+    # disk); everywhere else it is the plain local header offset.
+    def input_stream_offset # :nodoc:
+      offset = local_header_offset
+      return offset unless @zipfile.respond_to?(:seek_disk)
+      return offset if offset.kind_of?(::Zip::MultiVolumeIo::Position)
+
+      ::Zip::MultiVolumeIo::Position.new(disk_number_start, offset)
     end
 
     def gather_fileinfo_from_srcpath(src_path) # :nodoc:
@@ -764,6 +784,16 @@ module Zip
       static_sized_fields_buf = io.read(::Zip::LOCAL_ENTRY_STATIC_HEADER_LENGTH) || ''
 
       unless static_sized_fields_buf.bytesize == ::Zip::LOCAL_ENTRY_STATIC_HEADER_LENGTH
+        if io.respond_to?(:seek_disk)
+          position = io.tell
+          raise MultiVolumeError.new(
+            'Premature end of file. Not enough data for zip entry local ' \
+            "header (the archive ended at #{position})",
+            disk_number: position.disk_number,
+            disk_offset: position.offset
+          )
+        end
+
         raise Error, 'Premature end of file. Not enough data for zip entry local header'
       end
 
@@ -830,9 +860,10 @@ module Zip
       if for_local_header
         @size, @compressed_size = @extra[:zip64].parse(@size, @compressed_size)
       else
-        @size, @compressed_size, @local_header_offset = @extra[:zip64].parse(
-          @size, @compressed_size, @local_header_offset
-        )
+        @size, @compressed_size, @local_header_offset, @disk_number_start =
+          @extra[:zip64].parse(
+            @size, @compressed_size, @local_header_offset, @disk_number_start
+          )
       end
     end
 

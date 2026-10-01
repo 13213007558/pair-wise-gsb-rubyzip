@@ -43,6 +43,26 @@ module Zip
   class InputStream
     CHUNK_SIZE = 32_768 # :nodoc:
 
+    # Wraps an IO and limits the number of bytes that can be read from it,
+    # so that a decompressor cannot read past the end of an entry's
+    # compressed data. Reads past the limit behave like end of file.
+    class BoundedReader # :nodoc:
+      def initialize(io, length)
+        @io = io
+        @remaining = length
+      end
+
+      def read(length = nil, outbuf = nil)
+        return @io.read(0, outbuf) if length&.zero?
+        return nil if @remaining.zero?
+
+        length = @remaining if length.nil? || length > @remaining
+        data = @io.read(length, outbuf)
+        @remaining -= data.bytesize if data
+        data
+      end
+    end
+
     include ::Zip::IOExtras::AbstractInputStream
 
     # Opens the indicated zip file. An exception is thrown
@@ -172,23 +192,35 @@ module Zip
 
              get_decrypted_io
            else
-             @archive_io
+             bounded_archive_io
            end
 
       get_decompressor(io)
+    end
+
+    # When reading from a multi-volume archive, bound the IO to the
+    # current entry's compressed data, so that inflating the entry cannot
+    # read ahead into volumes the entry does not occupy.
+    def bounded_archive_io # :nodoc:
+      return @archive_io unless @archive_io.respond_to?(:seek_disk)
+
+      BoundedReader.new(@archive_io, current_compressed_size)
+    end
+
+    def current_compressed_size # :nodoc:
+      if @current_entry.incomplete? && @current_entry.crc == 0 &&
+         @current_entry.compressed_size == 0 && @complete_entry
+        @complete_entry.compressed_size
+      else
+        @current_entry.compressed_size
+      end
     end
 
     def get_decrypted_io # :nodoc:
       header = @archive_io.read(@decrypter.header_bytesize)
       @decrypter.reset!(header)
 
-      compressed_size =
-        if @current_entry.incomplete? && @current_entry.crc == 0 &&
-           @current_entry.compressed_size == 0 && @complete_entry
-          @complete_entry.compressed_size
-        else
-          @current_entry.compressed_size
-        end
+      compressed_size = current_compressed_size
 
       if @decrypter.kind_of?(::Zip::AESDecrypter)
         compressed_size -= @decrypter.header_bytesize
