@@ -38,12 +38,19 @@ module Zip
     # wider values are only present in the extra field for base values set to all FFs
     # returns the final values for the four attributes (from the base or zip64 extra record)
     def parse(original_size, compressed_size, relative_header_offset = nil, disk_start_number = nil)
+      # The wide fields only appear in the record when the corresponding
+      # base-header field is set to all FFs, and they always follow this
+      # fixed order: original size, compressed size, relative header offset,
+      # disk start number. Each field must therefore only be consumed when
+      # its own base field is the FF placeholder, otherwise the byte stream
+      # gets misaligned (this matters for split archives that record large
+      # disk-local offsets alongside small entry sizes).
       @original_size = extract(8, 'Q<') if original_size == 0xFFFFFFFF
       @compressed_size = extract(8, 'Q<') if compressed_size == 0xFFFFFFFF
-      if relative_header_offset && relative_header_offset == 0xFFFFFFFF
+      if relative_header_offset == 0xFFFFFFFF
         @relative_header_offset = extract(8, 'Q<')
       end
-      @disk_start_number = extract(4, 'V') if disk_start_number && disk_start_number == 0xFFFF
+      @disk_start_number = extract(4, 'V') if disk_start_number == 0xFFFF
       @content = nil
       [@original_size || original_size,
        @compressed_size || compressed_size,

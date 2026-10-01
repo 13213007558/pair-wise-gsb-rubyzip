@@ -87,7 +87,13 @@ module Zip
 
       @lineno = 0
       @pos    = 0
-      @archive_io.seek(@current_entry.local_header_offset, IO::SEEK_SET)
+      location = if @archive_io.respond_to?(:zip_volume_io?)
+                   [@current_entry.disk_number_start,
+                    @current_entry.local_header_offset]
+                 else
+                   @current_entry.local_header_offset
+                 end
+      @archive_io.seek(location, IO::SEEK_SET)
       open_entry
     end
 
@@ -161,9 +167,24 @@ module Zip
         raise StreamingError, @current_entry
       end
 
+      bound_entry_data!
       @decompressor = assemble_io
       flush
       @current_entry
+    end
+
+    # For multi-volume archives, stop reading an entry's compressed data at
+    # its declared end, so an entry ending exactly on a disk boundary does
+    # pull in bytes (or disks) belonging to the next entry.
+    def bound_entry_data! # :nodoc:
+      return unless @archive_io.respond_to?(:zip_volume_io?)
+
+      data_size = @current_entry.compressed_size
+      data_size += @decrypter.header_bytesize if @decrypter
+      if @current_entry.encrypted? && @decrypter&.kind_of?(::Zip::AESDecrypter)
+        data_size += ::Zip::AESEncryption::AUTHENTICATION_CODE_LENGTH
+      end
+      @archive_io.bound_data!(data_size)
     end
 
     def assemble_io # :nodoc:

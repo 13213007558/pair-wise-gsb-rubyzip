@@ -32,10 +32,12 @@ module Zip
       super(dirty_on_create: false)
       @entry_set = entries.kind_of?(EntrySet) ? entries : EntrySet.new(entries)
       @comment   = comment
+      @volume_io = false
     end
 
     def read_from_stream(io)
-      read_eocds(io)
+      @volume_io = io.respond_to?(:zip_volume_io?)
+      @volume_io ? read_eocds_from_volumes(io) : read_eocds(io)
       read_central_directory_entries(io)
     end
 
@@ -117,8 +119,8 @@ module Zip
       size_of_zip64_e_o_c_d,
       _version_made_by,
       _version_needed_for_extract,
-      _number_of_this_disk,
-      _number_of_disk_with_start_of_cdir,
+      @number_of_this_disk,
+      @number_of_disk_with_start_of_cdir,
       _total_number_of_entries_in_cdir_on_this_disk,
       @size,
       size_in_bytes,
@@ -140,24 +142,24 @@ module Zip
 
     def unpack_64_eocd_locator(buffer) # :nodoc:
       _, # ZIP64_EOCD_LOCATOR_SIG. We know we have this at this point.
-      _, zip64_eocd_offset, = buffer.unpack('VVQ<V')
+      zip64_eocd_disk, zip64_eocd_offset, total_disks = buffer.unpack('VVQ<V')
 
-      zip64_eocd_offset
+      [zip64_eocd_disk, zip64_eocd_offset, total_disks]
     end
 
     # Unpack the EOCD and return a boolean indicating whether this header is
     # complete without needing Zip64 extensions.
     def unpack_e_o_c_d(buffer) # :nodoc:
       _, # END_OF_CD_SIG. We know we have this at this point.
-      number_of_this_disk,
-      number_of_disk_with_start_of_cdir,
+      @number_of_this_disk,
+      @number_of_disk_with_start_of_cdir,
       total_number_of_entries_in_cdir_on_this_disk,
       @size,
       size_in_bytes,
       @cdir_offset,
       comment_length = buffer.unpack('VvvvvVVv')
 
-      complete = !([number_of_this_disk, number_of_disk_with_start_of_cdir,
+      complete = !([@number_of_this_disk, @number_of_disk_with_start_of_cdir,
                     total_number_of_entries_in_cdir_on_this_disk, @size].any?(0xFFFF) ||
                     size_in_bytes == 0xFFFFFFFF || @cdir_offset == 0xFFFFFFFF)
 
@@ -177,7 +179,11 @@ module Zip
       # so we need to catch that *and* query `io#eof?` here.
       eof = false
       begin
-        io.seek(@cdir_offset, IO::SEEK_SET)
+        if @volume_io
+          io.seek([@number_of_disk_with_start_of_cdir, @cdir_offset], IO::SEEK_SET)
+        else
+          io.seek(@cdir_offset, IO::SEEK_SET)
+        end
       rescue Errno::EINVAL
         eof = true
       end
@@ -194,7 +200,11 @@ module Zip
                    entry.local_header_offset
                  end
 
-        unless offset.nil?
+        # Reading the local headers up front would force every disk to be
+        # opened, even for entries that are never accessed. For a
+        # multi-volume archive the local header is read lazily when the
+        # entry is opened instead.
+        unless offset.nil? || @volume_io
           io_save = io.tell
           io.seek(offset, IO::SEEK_SET)
           entry.read_extra_field(read_local_extra_field(io), local: true)
@@ -240,7 +250,7 @@ module Zip
           data.slice(zip64_eocd_location..zip64_eocd_locator)
         else
           # No. Read its location from the locator and then read it in.
-          zip64_eocd_location = unpack_64_eocd_locator(
+          _, zip64_eocd_location, = unpack_64_eocd_locator(
             data.slice(zip64_eocd_locator..eocd_location)
           )
           unless zip64_eocd_location
@@ -253,6 +263,97 @@ module Zip
 
       # Finally, unpack the Zip64 EOCD.
       unpack_64_e_o_c_d(zip64_eocd_data)
+    end
+
+    # Reads the EOCD / Zip64 EOCD of a multi-volume archive. The EOCD and
+    # Zip64 locator live on the last disk; the Zip64 EOCD is located via the
+    # (disk, offset) pair in the locator. All offsets are relative to the
+    # disk the record lives on. Only the last disk is opened by this method.
+    def read_eocds_from_volumes(io)
+      data = io.read_last_disk_tail
+      last_disk = io.tell[0]
+
+      eocd_location = data.rindex([END_OF_CD_SIG].pack('V'))
+      unless eocd_location
+        # The EOCD itself may start on the previous disk and straddle the
+        # final disk boundary. Pull the minimum tail of the previous disk
+        # needed to contain it (and the possible Zip64 records before it).
+        previous_tail = io.read_previous_disk_tail(MAX_END_OF_CD_SIZE)
+        data = previous_tail + data
+        eocd_location = data.rindex([END_OF_CD_SIG].pack('V'))
+        raise Error, 'Zip end of central directory signature not found' unless eocd_location
+      end
+
+      complete = unpack_e_o_c_d(data.slice(eocd_location..-1))
+
+      locator_total_disks = read_zip64_eocd_from_volumes(io, data, eocd_location) unless complete
+
+      validate_volume_numbers!(io, last_disk, locator_total_disks)
+    end
+
+    # Returns the total number of disks recorded by the Zip64 EOCD locator,
+    # or nil if there is no Zip64 record.
+    def read_zip64_eocd_from_volumes(io, data, eocd_location)
+      locator_location = data.rindex([ZIP64_EOCD_LOCATOR_SIG].pack('V'), eocd_location)
+      unless locator_location
+        raise Error, 'Zip64 end of central directory locator signature expected but not found'
+      end
+
+      zip64_disk, zip64_offset, total_disks = unpack_64_eocd_locator(
+        data.slice(locator_location..eocd_location)
+      )
+
+      io.seek([zip64_disk, zip64_offset], IO::SEEK_SET)
+      header = io.read(ZIP64_STATIC_EOCD_SIZE)
+      unless header.unpack1('V') == ZIP64_END_OF_CD_SIG
+        raise Error, 'Zip64 end of central directory signature not found'
+      end
+
+      size_of_record = header.unpack1('x4Q<')
+      extensible_size = size_of_record - (ZIP64_STATIC_EOCD_SIZE - 12)
+      rest = extensible_size.positive? ? io.read(extensible_size) : +''
+      unpack_64_e_o_c_d(header + rest)
+
+      total_disks
+    end
+
+    # Verifies the disk numbers stored in the archive against the disks that
+    # have actually been provided.
+    def validate_volume_numbers!(io, last_disk, locator_total_disks = nil)
+      provided = io.volume_set&.disk_count
+
+      if provided && last_disk != provided - 1
+        raise VolumeOrderError.new(
+          disk_number: @number_of_this_disk,
+          reason: "the end of central directory is on disk #{@number_of_this_disk} " \
+                  "but #{provided} disks were provided (last disk is #{provided - 1})"
+        )
+      end
+
+      if provided && locator_total_disks && locator_total_disks != provided
+        raise VolumeOrderError.new(
+          disk_number: last_disk,
+          reason: "the archive declares #{locator_total_disks} disks but " \
+                  "#{provided} were provided"
+        )
+      end
+
+      if @number_of_this_disk && @number_of_this_disk != last_disk
+        raise VolumeOrderError.new(
+          disk_number: @number_of_this_disk,
+          reason: "number of this disk is #{@number_of_this_disk} but the " \
+                  "end of central directory was found on disk #{last_disk}"
+        )
+      end
+
+      if provided && !@number_of_disk_with_start_of_cdir.nil? &&
+          (@number_of_disk_with_start_of_cdir.negative? ||
+           @number_of_disk_with_start_of_cdir >= provided)
+        raise VolumeOrderError.new(
+          disk_number: @number_of_disk_with_start_of_cdir,
+          reason: 'the central directory starts on a disk that was not provided'
+        )
+      end
     end
 
     def eocd_data(io)

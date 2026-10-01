@@ -60,6 +60,10 @@ module Zip
     # The name of this zip archive.
     attr_reader :name
 
+    # The {Zip::VolumeSet} backing a multi-volume archive, or nil for an
+    # ordinary archive.
+    attr_reader :volume_set
+
     # default -> false.
     attr_accessor :restore_ownership
 
@@ -78,13 +82,19 @@ module Zip
                    restore_permissions: DEFAULT_RESTORE_OPTIONS[:restore_permissions],
                    restore_times: DEFAULT_RESTORE_OPTIONS[:restore_times],
                    compression_level: ::Zip.default_compression,
-                   suppress_extra_fields: false)
+                   suppress_extra_fields: false,
+                   volume_set: nil)
       super()
 
-      @name    = path_or_io.respond_to?(:path) ? path_or_io.path : path_or_io
+      @volume_set = volume_set
+      if volume_set
+        @name = nil
+      else
+        @name = path_or_io.respond_to?(:path) ? path_or_io.path : path_or_io
+      end
       @create  = create ? true : false # allow any truthy value to mean true
 
-      initialize_cdir(path_or_io, buffer: buffer)
+      initialize_cdir(path_or_io, buffer: buffer || !volume_set.nil?)
 
       @restore_ownership     = restore_ownership
       @restore_permissions   = restore_permissions
@@ -151,6 +161,86 @@ module Zip
           zf.write_buffer(io)
         rescue IOError => e
           raise unless e.message == 'not opened for writing'
+        end
+      end
+
+      # Opens a multi-volume (split) archive. Unlike a single-file archive,
+      # offsets in a multi-volume archive are relative to the disk each
+      # record lives on, so the disks must not be concatenated into one big
+      # file. Disks are instead provided as seekable IO objects, keyed by
+      # 0-based disk number.
+      #
+      # There are two ways to specify the disks:
+      #
+      # * Pass a {Zip::VolumeSet}, or an enumerable of already-opened
+      #   seekable IO objects. IO objects passed directly this way are
+      #   owned by the caller and are never closed by rubyzip; close them
+      #   yourself after the archive is closed.
+      #
+      # * Pass +disk_count:+ together with an +opener:+ callable. The opener
+      #   receives a 0-based disk number and is invoked only when that disk
+      #   is needed; it must return an opened seekable IO, or nil if the
+      #   disk is unavailable (which raises {Zip::MissingVolumeError}). When
+      #   disks are opened this way rubyzip closes them again with +#close+
+      #   when the archive closes. Pass +auto_close: false+ to keep them open.
+      #
+      # ```
+      # # Caller-owned IO objects: rubyzip never closes them.
+      # volumes = (0...3).map { |d| File.open("part.z#{d.to_s.rjust(2, '0')}", 'rb') }
+      # begin
+      #   Zip::File.open_volume_set(volumes) { |zip| puts zip.read('a.txt') }
+      # ensure
+      #   volumes.each(&:close)
+      # end
+      #
+      # # Lazily opened disks: only disks needed for the entries read are
+      # # opened, and rubyzip closes them when the block finishes.
+      # Zip::File.open_volume_set(
+      #   disk_count: 3,
+      #   opener: ->(disk_number) {
+      #     File.open("part.z#{disk_number.to_s.rjust(2, '0')}", 'rb')
+      #   }
+      # ) do |zip|
+      #   puts zip.read('a.txt')
+      # end
+      # ```
+      #
+      # @param volumes [Zip::VolumeSet, Enumerable] a volume set or an
+      #   enumerable of seekable IO objects.
+      # @param disk_count [Integer, nil] total number of disks when using an
+      #   opener.
+      # @param opener [#call, nil] opens a disk given its 0-based number.
+      # @param auto_close [Boolean] whether to close lazily-opened disks when
+      #   the archive closes (default: true).
+      def open_volume_set(volumes = nil, disk_count: nil, opener: nil,
+                          auto_close: true, &block)
+        volume_set =
+          case volumes
+          when VolumeSet
+            volumes
+          when Integer
+            VolumeSet.open(volumes, opener, closer: auto_close ? nil : proc {})
+          when nil
+            if disk_count && opener
+              VolumeSet.open(disk_count, opener,
+                             closer: auto_close ? nil : proc {})
+            else
+              raise ArgumentError, 'provide a Zip::VolumeSet, an enumerable '
+                'of IO objects, or disk_count: with an opener: callable'
+            end
+          else
+            VolumeSet.from_ios(volumes)
+          end
+
+        reader = volume_set.reader(volume_set.disk_count - 1)
+        zf = ::Zip::File.new(reader, buffer: true, volume_set: volume_set)
+
+        return zf unless block_given?
+
+        begin
+          yield zf
+        ensure
+          zf.close
         end
       end
 
@@ -396,7 +486,7 @@ module Zip
     # Commits changes that has been made since the previous commit to
     # the zip archive.
     def commit
-      return if name.kind_of?(StringIO) || !commit_required?
+      return if @volume_set || name.kind_of?(StringIO) || !commit_required?
 
       on_success_replace do |tmp_file|
         ::Zip::OutputStream.open(tmp_file, suppress_extra_fields: @suppress_extra_fields) do |zos|
@@ -424,6 +514,10 @@ module Zip
     # Closes the zip file committing any changes that has been made.
     def close
       commit
+    ensure
+      # Only closes disks that rubyzip itself opened via an opener; IO
+      # objects supplied by the caller are never closed.
+      @volume_set&.close
     end
 
     # Returns true if any changes has been made to this archive since
@@ -517,7 +611,10 @@ module Zip
     def initialize_cdir(path_or_io, buffer: false)
       @cdir = ::Zip::CentralDirectory.new
 
-      if ::File.size?(@name.to_s)
+      if @volume_set
+        @create = false
+        @cdir.read_from_stream(path_or_io)
+      elsif ::File.size?(@name.to_s)
         # There is a file, which exists, that is associated with this zip.
         @create = false
         @file_permissions = ::File.stat(@name).mode

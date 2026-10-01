@@ -5,6 +5,91 @@ module Zip
   # you don't need to know what sort of error has been raised.
   class Error < StandardError; end
 
+  # The superclass for errors raised while reading an archive that spans
+  # multiple disks (a multi-volume or split archive). Every error of this
+  # type reports the +disk_number+ (0-based) and, where it is known, the
+  # +offset+ within that disk at which the problem was detected.
+  class VolumeError < Error
+    # The 0-based number of the disk the error relates to, or nil.
+    attr_reader :disk_number
+
+    # The byte offset within the disk, or nil.
+    attr_reader :offset
+
+    # Create a new VolumeError for the given disk number and offset.
+    def initialize(disk_number: nil, offset: nil, message: nil, **)
+      super(message)
+      @disk_number = disk_number
+      @offset = offset
+      @custom_message = message
+    end
+
+    # The message returned by this error.
+    def message
+      location = "disk #{@disk_number.inspect}"
+      location << " at offset #{@offset}" unless @offset.nil?
+      "#{super} (#{location})".sub(/^ \(/, '(')
+    end
+  end
+
+  # Error raised when a disk (volume) that the archive refers to cannot be
+  # opened. With a +Zip::VolumeSet+ backed by an opener block this means the
+  # opener returned nil (or raised).
+  class MissingVolumeError < VolumeError
+    # Create a new MissingVolumeError for the given disk number.
+    def initialize(disk_number: nil, offset: nil, message: nil)
+      super
+    end
+
+    # The message returned by this error.
+    def message
+      return super if @custom_message
+
+      "Archive references disk #{disk_number}, which could not be opened. " \
+        "(expected an opened, seekable IO; got nil or an error)"
+    end
+  end
+
+  # Error raised when the disk numbers recorded in the archive do not match
+  # the disks that have been provided: for example, the end of central
+  # directory claims to live on a different disk from the last available
+  # disk, the total disk count is wrong, or an entry points at a disk
+  # outside the archive.
+  class VolumeOrderError < VolumeError
+    # Create a new VolumeOrderError.
+    def initialize(disk_number: nil, offset: nil, reason: nil)
+      @reason = reason
+      super(disk_number: disk_number, offset: offset)
+    end
+
+    # The message returned by this error.
+    def message
+      reason = @reason || 'the disk numbering in the archive is inconsistent '
+        'with the disks provided'
+      "Volume order error: #{reason} (disk #{disk_number.inspect}" \
+        "#{offset.nil? ? '' : ", offset #{offset}"})"
+    end
+  end
+
+  # Error raised when a record (local header, compressed data or central
+  # directory record) starts on a disk but runs past the end of that disk
+  # and the next disk is missing, or otherwise ends inside the archive
+  # without the following disk being present.
+  class VolumeTruncationError < VolumeError
+    # Create a new VolumeTruncationError.
+    def initialize(disk_number: nil, offset: nil, what: 'archive data', message: nil)
+      @what = what
+      super
+    end
+
+    # The message returned by this error.
+    def message
+      "Unexpected end of disk #{disk_number} at offset #{offset} while " \
+        "reading #{@what}: the record continues on the next disk but that " \
+        'disk is missing or truncated.'
+    end
+  end
+
   # Error raised if an unsupported compression method is used.
   class CompressionMethodError < Error
     # The compression method that has caused this error.

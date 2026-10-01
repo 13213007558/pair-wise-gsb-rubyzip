@@ -271,6 +271,38 @@ end # The `InputStream` is closed at the end of the block.
 
 Any attempt to move about in a zip file opened with `Zip::InputStream` could result in the incorrect entry being accessed and/or Zlib buffer errors. If you need random access in a zip file, use `Zip::File`.
 
+### Reading a multi-volume (split) Zip file
+
+A multi-volume (spanned or split) archive stores its records on more than one disk. The offsets stored in the central directory and in each entry are relative to the start of the disk the record lives on, so the disks must not be joined together into one big file before reading.
+
+`Zip::File.open_volume_set` reads such an archive without concatenating the disks. Disks are identified by 0-based disk number and are served as seekable IO objects. Local headers, compressed data and central directory records may each straddle a disk boundary, and Zip64 disk numbers and offsets are honoured.
+
+Pass an enumerable of already-opened, seekable IO objects. Rubyzip never closes IO objects supplied this way; their lifetime is the caller's responsibility:
+
+```ruby
+volumes = ['foo.z01', 'foo.z02', 'foo.zip'].map { |name| File.open(name, 'rb') }
+begin
+  Zip::File.open_volume_set(volumes) do |zip_file|
+    puts zip_file.read('large.csv')
+  end
+ensure
+  volumes.each(&:close)
+end
+```
+
+Alternatively, pass the number of disks and an opener callable. The opener is invoked with a 0-based disk number only when that disk is actually needed, so reading a single entry only opens the disks that entry and the central directory require. IO objects opened this way are closed by rubyzip when the archive closes; pass `auto_close: false` (or supply your own `Zip::VolumeSet`) to keep them open:
+
+```ruby
+Zip::File.open_volume_set(
+  disk_count: 3,
+  opener: ->(disk_number) { File.open(format('foo.z%02d', disk_number + 1), 'rb') }
+) do |zip_file|
+  puts zip_file.read('large.csv')
+end
+```
+
+Errors related to the volume layout all extend `Zip::VolumeError` and report the relevant disk number and, where known, the offset within that disk: `Zip::MissingVolumeError` when a referenced disk cannot be opened, `Zip::VolumeOrderError` when the disk numbers in the archive do not match the disks provided, and `Zip::VolumeTruncationError` when a record is cut off at a disk boundary.
+
 ### Encryption and Password Protection (experimental)
 
 Rubyzip supports reading and writing zip files with AES encryption (reading: version 3.1 and later; writing: version 3.7 and later), and reading and writing zip files with traditional zip encryption (a.k.a. "ZipCrypto"). Encryption is currently only available with the stream API, with either files or buffers, e.g.:
