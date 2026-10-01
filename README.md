@@ -96,6 +96,28 @@ end
 
 You can generate a Zip archive in memory using `Zip::OutputStream.write_buffer`.
 
+### Writing a Zip archive straight to a write-only stream
+
+For destinations that only accept bytes and cannot be seeked (for example an HTTP response body), use `Zip::OutputStream.write_stream` (or construct an output stream with `write_only: true`). Each local entry header is written with general purpose bit 3 set and leaves its CRC and sizes blank; a [data descriptor](https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT) record carrying the real values follows the entry data, and the central directory is written when the stream is closed. The archive is produced incrementally — nothing is buffered in memory or in a temporary file, and the destination itself is not closed.
+
+```ruby
+require 'zip'
+
+# `io` only needs a #write (or #<<) method; #seek and #tell are never used.
+Zip::OutputStream.write_stream(io) do |zos|
+  zos.put_next_entry('first.txt')
+  zos.write('Hello world!')
+
+  zos.put_next_entry('second.txt', nil, nil, Zip::Entry::STORED)
+  # Entry data can be provided piece by piece, straight from another source.
+  while (chunk = source.read(16_384))
+    zos.write(chunk)
+  end
+end
+```
+
+Both `STORED` and `DEFLATED` entries (and empty entries) are supported. Because the local headers do not contain entry sizes, archives produced this way cannot be read sequentially with `Zip::InputStream`; read them with `Zip::File` (or another central-directory based reader such as `unzip`). Entries beyond the 32-bit size and offset limits are handled with Zip64 extensions; if `Zip.write_zip64_support` is off and the archive would exceed those limits, a `Zip::Error` is raised.
+
 ### Suppressing extra fields
 
 If you wish to suppress extra fields from being added to your entries, you can do so by passing the `suppress_extra_fields` parameter to any of the archive opening calls within `Zip::File` or `Zip::OutputStream`, e.g.:

@@ -11,6 +11,10 @@ module Zip
   LOCAL_ENTRY_SIGNATURE                  = 0x04034b50
   LOCAL_ENTRY_STATIC_HEADER_LENGTH       = 30
   LOCAL_ENTRY_TRAILING_DESCRIPTOR_LENGTH = 4 + 4 + 4
+  # General purpose bit flag: the entry's CRC and sizes are written in a
+  # data descriptor immediately after the entry data rather than in the
+  # local header.
+  GP_FLAG_DATA_DESCRIPTOR                = 0x0008
   VERSION_MADE_BY                        = 52 # this library's version
   VERSION_NEEDED_TO_EXTRACT              = 20
   VERSION_NEEDED_TO_EXTRACT_ZIP64        = 45

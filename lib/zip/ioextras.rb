@@ -26,6 +26,7 @@ end
 
 require_relative 'ioextras/abstract_input_stream'
 require_relative 'ioextras/abstract_output_stream'
+require_relative 'ioextras/write_only_io'
 
 # Copyright (C) 2002-2004 Thomas Sondergaard
 # rubyzip is free software; you can redistribute it and/or

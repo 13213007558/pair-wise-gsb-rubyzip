@@ -31,6 +31,12 @@ module Zip
     attr_accessor :crc, :external_file_attributes, :fstype, :gp_flags,
                   :internal_file_attributes, :local_header_offset # :nodoc:
 
+    # When true, the local header is written without CRC or sizes even when
+    # they are known. This is used by write-only, non-seekable output
+    # streams, which set general purpose bit 3 and record the real values in
+    # a data descriptor after the entry data instead.
+    attr_accessor :local_header_blank_sizes # :nodoc:
+
     attr_reader :extra, :compression_level, :filepath # :nodoc:
 
     attr_writer :size # :nodoc:
@@ -42,6 +48,7 @@ module Zip
     def set_default_vars_values # :nodoc:
       @local_header_offset      = 0
       @local_header_size        = nil # not known until local entry is created or read
+      @local_header_blank_sizes = false
       @internal_file_attributes = 1
       @external_file_attributes = 0
       @header_signature         = ::Zip::CENTRAL_DIRECTORY_ENTRY_SIGNATURE
@@ -419,15 +426,16 @@ module Zip
 
     def pack_local_entry # :nodoc:
       zip64 = @extra[:zip64]
+      blank = @local_header_blank_sizes
       [::Zip::LOCAL_ENTRY_SIGNATURE,
        @version_needed_to_extract, # version needed to extract
        @gp_flags, # @gp_flags
        stored_compression_method,
        @time.to_binary_dos_time, # @last_mod_time
        @time.to_binary_dos_date, # @last_mod_date
-       @crc,
-       zip64 && zip64.compressed_size ? 0xFFFFFFFF : @compressed_size,
-       zip64 && zip64.original_size ? 0xFFFFFFFF : (@size || 0),
+       blank ? 0 : @crc,
+       zip64 && zip64.compressed_size ? 0xFFFFFFFF : (blank ? 0 : @compressed_size),
+       zip64 && zip64.original_size ? 0xFFFFFFFF : (blank ? 0 : (@size || 0)),
        name_size,
        @extra ? @extra.local_size : 0].pack('VvvvvvVVVvv')
     end
@@ -899,8 +907,18 @@ module Zip
     def prep_cdir_zip64_extra
       return unless ::Zip.write_zip64_support
 
-      if (@size && @size >= 0xFFFFFFFF) || @compressed_size >= 0xFFFFFFFF ||
-         @local_header_offset >= 0xFFFFFFFF
+      if @local_header_blank_sizes && zip64?
+        # The local header was written by a non-seekable stream with its
+        # sizes unknown, so it carries a Zip64 extra field. The central
+        # directory record must carry one too, with the now-known sizes.
+        @version_needed_to_extract =
+          [@version_needed_to_extract, VERSION_NEEDED_TO_EXTRACT_ZIP64].max
+        zip64 = @extra[:zip64]
+        zip64.original_size = @size if @size
+        zip64.compressed_size = @compressed_size
+        zip64.relative_header_offset = @local_header_offset if @local_header_offset >= 0xFFFFFFFF
+      elsif (@size && @size >= 0xFFFFFFFF) || @compressed_size >= 0xFFFFFFFF ||
+            @local_header_offset >= 0xFFFFFFFF
         @version_needed_to_extract =
           [@version_needed_to_extract, VERSION_NEEDED_TO_EXTRACT_ZIP64].max
         zip64 = @extra[:zip64] || @extra.create(:zip64)
