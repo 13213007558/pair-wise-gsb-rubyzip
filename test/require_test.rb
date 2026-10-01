@@ -39,7 +39,8 @@ class RequireTest < Minitest::Test
     script = "require 'zip'; " \
              "d = Zip::AESDecrypter.new('password', Zip::AESEncryption::STRENGTH_128_BIT); " \
              "d.reset!([127, 254, 117, 113, 255, 209, 171, 131, 179, 106].pack('C*')); " \
-             "print d.decrypt([34, 33, 106].map(&:chr).join) == [75, 4, 0].pack('C*')"
+             "d.decrypt([34, 33, 106].map(&:chr).join); " \
+             "print d.finalize == [75, 4, 0].pack('C*')"
 
     assert_equal 'true', subprocess(script)
   end

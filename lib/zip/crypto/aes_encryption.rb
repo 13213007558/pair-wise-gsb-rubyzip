@@ -168,24 +168,44 @@ module Zip
   class AESDecrypter < Decrypter # :nodoc:
     include AESEncryption
 
+    # The ciphertext may arrive in arbitrary chunks (1 byte, 7 bytes,
+    # anything) that bear no relation to the 16-byte CTR block size. The
+    # CTR counter tracks the *absolute* byte offset in the stream, so only
+    # whole blocks are run through the cipher here and any trailing partial
+    # block is buffered until more ciphertext arrives - mirroring how
+    # `AESEncrypter#encrypt` does the same on the write side. Decrypting a
+    # partial block on its own would wrongly re-use counter value 1 and
+    # corrupt the plaintext.
     def decrypt(encrypted_data)
       @hmac.update(encrypted_data)
+      @pending ||= +''.b
+      @pending << encrypted_data
 
-      idx = 0
-      decrypted_data = +''
-      amount_to_read = encrypted_data.size
-
-      while amount_to_read.positive?
+      decrypted_data = +''.b
+      while @pending.bytesize >= BLOCK_SIZE
+        block = @pending.slice!(0, BLOCK_SIZE)
         @cipher.iv = [@counter + 1].pack('Vx12')
-        begin_index = BLOCK_SIZE * idx
-        end_index = begin_index + [BLOCK_SIZE, amount_to_read].min
-        decrypted_data << @cipher.update(encrypted_data[begin_index...end_index])
-        amount_to_read -= BLOCK_SIZE
+        decrypted_data << @cipher.update(block)
         @counter += 1
-        idx += 1
       end
 
-      # JRuby requires finalization of the cipher. This is a bug, as noted in
+      decrypted_data
+    end
+
+    # Flushes the final, not-block-aligned ciphertext bytes. WinZip AES
+    # leaves the last CTR block partial, so this must run once, after the
+    # last ciphertext byte has been fed in and before the authentication
+    # code is checked. Returns the tail of the plaintext.
+    def finalize
+      decrypted_data = +''.b
+      unless @pending.nil? || @pending.empty?
+        @cipher.iv = [@counter + 1].pack('Vx12')
+        decrypted_data << @cipher.update(@pending)
+        @pending.clear
+      end
+
+      # JRuby requires finalization of the cipher when the last block fed to
+      # it is a partial one. This is a bug, as noted in
       # jruby/jruby-openssl#182 and jruby/jruby-openssl#183.
       decrypted_data << @cipher.final if defined?(JRUBY_VERSION)
       decrypted_data
@@ -199,6 +219,7 @@ module Zip
       raise Error, 'Bad password' if enc_pwd_verify != pwd_verify
 
       @counter = 0
+      @pending = +''.b
       @cipher = OpenSSL::Cipher::AES.new(@bits, :CTR)
       @cipher.decrypt
       @cipher.key = enc_key
@@ -206,8 +227,27 @@ module Zip
     end
 
     def check_integrity!(io)
-      auth_code = io.read(AUTHENTICATION_CODE_LENGTH)
-      raise Error, 'Integrity fault' if @hmac.digest[0...AUTHENTICATION_CODE_LENGTH] != auth_code
+      auth_code = read_exactly(io, AUTHENTICATION_CODE_LENGTH)
+      if auth_code.bytesize != AUTHENTICATION_CODE_LENGTH ||
+         @hmac.digest[0...AUTHENTICATION_CODE_LENGTH] != auth_code
+        raise Error, 'Integrity fault'
+      end
+    end
+
+    private
+
+    # Reads exactly `length` bytes, tolerating short reads from the
+    # underlying IO. Returns fewer bytes only if the stream is exhausted,
+    # which (for the trailing authentication code) means truncation.
+    def read_exactly(io, length)
+      data = +''.b
+      while data.bytesize < length
+        chunk = io.read(length - data.bytesize)
+        break if chunk.nil? || chunk.empty?
+
+        data << chunk
+      end
+      data
     end
   end
 end

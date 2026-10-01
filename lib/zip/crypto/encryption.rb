@@ -14,6 +14,12 @@ module Zip
   end
 
   class Decrypter # :nodoc:all
+    # Flushes any plaintext the decrypter still has buffered once the last
+    # ciphertext byte has been fed in. Returns an empty string for stream
+    # ciphers that emit output directly from `decrypt`.
+    def finalize
+      ''.b
+    end
   end
 end
 
