@@ -393,6 +393,24 @@ module Zip
       self
     end
 
+    # Builds a Zip::ExtractPlan for extracting every entry in the archive
+    # into +destination_directory+, preserving the archive's directory
+    # structure. Nothing is written until the returned plan is executed.
+    #
+    # This is the two-phase alternative to #extract_all for batch imports:
+    # the plan lists every target path, overwrite decision and conflict
+    # (path traversal, case-folding collisions, file-vs-directory clashes,
+    # symlinks) up front, and only commits once all conflicts have been
+    # resolved. On failure during execution, everything written by the run
+    # is rolled back and pre-existing files are restored.
+    #
+    # See Zip::ExtractPlan for the available options and resolution API.
+    # Note that this Zip::File must remain open while the plan is executed.
+    def extract_plan(destination_directory = '.', **options)
+      entries.each { |entry| apply_restore_options(entry) }
+      ExtractPlan.new(self, destination_directory, **options)
+    end
+
     # Commits changes that has been made since the previous commit to
     # the zip archive.
     def commit

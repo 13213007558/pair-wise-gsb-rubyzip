@@ -134,6 +134,11 @@ module Zip
     end
   end
 
+  # Error raised when an extraction plan cannot be executed: either conflicts
+  # found during planning are still unresolved, or a path condition verified
+  # at execution time no longer holds. See Zip::ExtractPlan.
+  class ExtractPlanError < Error; end
+
   # Error raised if there is not enough metadata for the entry to be streamed.
   class StreamingError < Error
     # The entry that has caused this error.
