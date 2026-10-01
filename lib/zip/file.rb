@@ -50,6 +50,11 @@ module Zip
   #
   # Zip::FileSystem offers an alternative API that emulates ruby's
   # interface for accessing the filesystem, ie. the ::File and ::Dir classes.
+  #
+  # Pass +reproducible: true+ (or a Hash of options) when creating an
+  # archive to normalize entry order, timestamps, permissions and extra
+  # fields, so that archives built from the same input content are
+  # byte-for-byte identical. See Zip::Reproducible for the exact policy.
   class File
     include Enumerable
     extend Forwardable
@@ -78,7 +83,8 @@ module Zip
                    restore_permissions: DEFAULT_RESTORE_OPTIONS[:restore_permissions],
                    restore_times: DEFAULT_RESTORE_OPTIONS[:restore_times],
                    compression_level: ::Zip.default_compression,
-                   suppress_extra_fields: false)
+                   suppress_extra_fields: false,
+                   reproducible: false)
       super()
 
       @name    = path_or_io.respond_to?(:path) ? path_or_io.path : path_or_io
@@ -91,6 +97,7 @@ module Zip
       @restore_times         = restore_times
       @compression_level     = compression_level
       @suppress_extra_fields = suppress_extra_fields
+      @reproducible          = ::Zip::Reproducible.normalize_options(reproducible)
     end
 
     class << self
@@ -102,13 +109,15 @@ module Zip
                restore_permissions: DEFAULT_RESTORE_OPTIONS[:restore_permissions],
                restore_times: DEFAULT_RESTORE_OPTIONS[:restore_times],
                compression_level: ::Zip.default_compression,
-               suppress_extra_fields: false)
+               suppress_extra_fields: false,
+               reproducible: false)
         zf = ::Zip::File.new(file_name, create:                create,
                                         restore_ownership:     restore_ownership,
                                         restore_permissions:   restore_permissions,
                                         restore_times:         restore_times,
                                         compression_level:     compression_level,
-                                        suppress_extra_fields: suppress_extra_fields)
+                                        suppress_extra_fields: suppress_extra_fields,
+                                        reproducible:          reproducible)
 
         return zf unless block_given?
 
@@ -128,7 +137,8 @@ module Zip
                       restore_permissions: DEFAULT_RESTORE_OPTIONS[:restore_permissions],
                       restore_times: DEFAULT_RESTORE_OPTIONS[:restore_times],
                       compression_level: ::Zip.default_compression,
-                      suppress_extra_fields: false)
+                      suppress_extra_fields: false,
+                      reproducible: false)
         unless IO_METHODS.map { |method| io.respond_to?(method) }.all? || io.kind_of?(String)
           raise 'Zip::File.open_buffer expects a String or IO-like argument' \
                 "(responds to #{IO_METHODS.join(', ')}). Found: #{io.class}"
@@ -141,7 +151,8 @@ module Zip
                                  restore_permissions:   restore_permissions,
                                  restore_times:         restore_times,
                                  compression_level:     compression_level,
-                                 suppress_extra_fields: suppress_extra_fields)
+                                 suppress_extra_fields: suppress_extra_fields,
+                                 reproducible:          reproducible)
 
         return zf unless block_given?
 
@@ -400,7 +411,7 @@ module Zip
 
       on_success_replace do |tmp_file|
         ::Zip::OutputStream.open(tmp_file, suppress_extra_fields: @suppress_extra_fields) do |zos|
-          @cdir.each do |e|
+          entries_for_commit.each do |e|
             e.write_to_zip_output_stream(zos)
             e.clean_up
           end
@@ -416,7 +427,7 @@ module Zip
       return io unless commit_required?
 
       ::Zip::OutputStream.write_buffer(io, suppress_extra_fields: @suppress_extra_fields) do |zos|
-        @cdir.each { |e| e.write_to_zip_output_stream(zos) }
+        entries_for_commit.each { |e| e.write_to_zip_output_stream(zos) }
         zos.comment = comment
       end
     end
@@ -479,6 +490,19 @@ module Zip
       entry.restore_ownership   = @restore_ownership
       entry.restore_permissions = @restore_permissions
       entry.restore_times       = @restore_times
+    end
+
+    # The entries to write on commit, in write order. When reproducible
+    # output is enabled, entries are first normalized (fixed timestamps,
+    # permissions and extra fields - see Zip::Reproducible) and then
+    # sorted by name bytes, so the output does not depend on insertion
+    # order or source file metadata.
+    def entries_for_commit
+      entries = @cdir.entries
+      return entries unless @reproducible
+
+      entries.each { |entry| ::Zip::Reproducible.normalize_entry!(entry, @reproducible) }
+      entries.sort_by { |entry| entry.name.dup.force_encoding(::Encoding::BINARY) }
     end
 
     # Resolves +entry+ to an Array of the Zip::Entry objects it refers to:

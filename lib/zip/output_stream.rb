@@ -17,6 +17,15 @@ module Zip
   # the method put_next_entry that closes the current entry
   # and creates a new.
   #
+  # Pass +reproducible: true+ (or a Hash of options) to normalize the
+  # timestamp, permissions, extra fields and name encoding of every entry
+  # as it is written, so that the same entries written under the same
+  # Ruby/zlib versions and compression settings produce byte-for-byte
+  # identical archives. Note that, as a stream, entries are written in
+  # the order they are added - use Zip::File (which also sorts entries
+  # by name) if the input order may vary. See Zip::Reproducible for the
+  # exact policy.
+  #
   # Please refer to ZipInputStream for example code.
   #
   # java.util.zip.ZipOutputStream is the original inspiration for this
@@ -29,8 +38,16 @@ module Zip
 
     # Opens the indicated zip file. If a file with that name already
     # exists it will be overwritten.
-    def initialize(file_name, stream: false, encrypter: nil, suppress_extra_fields: false, **opts)
+    def initialize(file_name, stream: false, encrypter: nil, suppress_extra_fields: false,
+                   reproducible: false, **opts)
       super(**opts)
+      @reproducible = ::Zip::Reproducible.normalize_options(reproducible)
+      if @reproducible && encrypter
+        raise ::Zip::NonReproducibleError,
+              'encrypted archives are not reproducible: encryption writes a random ' \
+              'header/salt, so the output bytes differ between runs.'
+      end
+
       @file_name = file_name
       @output_stream = if stream
                          iostream = Zip::RUNNING_ON_WINDOWS ? @file_name : @file_name.dup
@@ -52,28 +69,32 @@ module Zip
       # Same as #initialize but if a block is passed the opened
       # stream is passed to the block and closed when the block
       # returns.
-      def open(file_name, encrypter: nil, suppress_extra_fields: false, **opts)
+      def open(file_name, encrypter: nil, suppress_extra_fields: false, reproducible: false, **opts)
         unless block_given?
           return new(
             file_name,
             encrypter:             encrypter,
             suppress_extra_fields: suppress_extra_fields,
+            reproducible:          reproducible,
             **opts
           )
         end
 
         zos = new(file_name, stream: false, encrypter: encrypter,
-                  suppress_extra_fields: suppress_extra_fields, **opts)
+                  suppress_extra_fields: suppress_extra_fields,
+                  reproducible: reproducible, **opts)
         yield zos
       ensure
         zos.close if zos
       end
 
       # Same as #open but writes to a filestream instead
-      def write_buffer(io = ::StringIO.new, encrypter: nil, suppress_extra_fields: false, **opts)
+      def write_buffer(io = ::StringIO.new, encrypter: nil, suppress_extra_fields: false,
+                       reproducible: false, **opts)
         io.binmode if io.respond_to?(:binmode)
         zos = new(io, stream: true, encrypter: encrypter,
-                  suppress_extra_fields: suppress_extra_fields, **opts)
+                  suppress_extra_fields: suppress_extra_fields,
+                  reproducible: reproducible, **opts)
         yield zos
         zos.close_buffer
       end
@@ -124,6 +145,7 @@ module Zip
           )
         end
 
+      ::Zip::Reproducible.normalize_entry!(new_entry, @reproducible) if @reproducible
       init_next_entry(new_entry)
       @current_entry = new_entry
     end
@@ -133,6 +155,7 @@ module Zip
       raise Error, 'zip stream is closed' if @closed
       raise Error, 'entry is not a ZipEntry' unless entry.kind_of?(Entry)
 
+      ::Zip::Reproducible.normalize_entry!(entry, @reproducible) if @reproducible
       finalize_current_entry
       check_duplicate_name(entry, 'copy_raw_entry')
       @cdir << entry

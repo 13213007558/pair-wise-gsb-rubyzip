@@ -91,6 +91,12 @@ module Zip
     end
   end
 
+  # Error raised when reproducible output is requested but an entry carries
+  # metadata that cannot be normalized into a deterministic form (for
+  # example, an explicitly provided extra field that is not on the allowed
+  # list, or an entry name that is not valid UTF-8).
+  class NonReproducibleError < Error; end
+
   # Error raised if an entry is larger on extraction than it is advertised
   # to be.
   class EntrySizeError < Error

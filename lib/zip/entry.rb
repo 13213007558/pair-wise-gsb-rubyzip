@@ -104,8 +104,28 @@ module Zip
                             end
       @extra              =
         extra.kind_of?(ExtraField) ? extra : ExtraField.new(extra.to_s)
+      # Whether the extra field data was explicitly supplied by the caller
+      # (rather than read from an archive or gathered automatically). Used
+      # by Zip::Reproducible to decide whether dropping a non-allowlisted
+      # field would silently lose user data.
+      @explicit_extra     = !@extra.empty?
 
       set_compression_level_flags
+    end
+
+    # Whether this entry's extra field data was explicitly provided via the
+    # +extra:+ argument, as opposed to being read from an existing archive
+    # or gathered from the filesystem.
+    def explicit_extra? # :nodoc:
+      @explicit_extra
+    end
+
+    # Sets the modification time directly as a DOSTime, without creating a
+    # universal time extra field. Used when normalizing entries for
+    # reproducible output (see Zip::Reproducible).
+    def dos_time=(dos_time) # :nodoc:
+      @time = dos_time
+      @dirty = true
     end
 
     # Is this entry encrypted?

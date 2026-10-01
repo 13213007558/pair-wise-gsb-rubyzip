@@ -116,6 +116,26 @@ Zip::OutputStream.open('archive.zip', suppress_extra_fields: [:ntfs, :zip64])
 
 Note that there are some extra fields that cannot be suppressed at all (e.g. `:aes`), and some which will only be suppressed if it is safe to do so (e.g. `:zip64`).
 
+### Reproducible (deterministic) archives
+
+If you key a build cache on the SHA-256 of a generated zip, you want archives built from the same input content to be byte-for-byte identical, regardless of the order entries were added in or the mtimes/permissions of the source files. Pass `reproducible: true` (or a Hash of options) to any of the archive opening calls within `Zip::File` or `Zip::OutputStream`:
+
+```ruby
+Zip::File.open('archive.zip', create: true, reproducible: true) do |zipfile|
+  zipfile.add('b.txt', 'path/to/b.txt')
+  zipfile.add('a.txt', 'path/to/a.txt')
+end
+```
+
+This normalizes the archive as follows (see the `Zip::Reproducible` RDoc for full details):
+
+- Entries are written sorted by name (`Zip::File` only; `Zip::OutputStream` writes entries in the order they are added).
+- All modification times are fixed - to the `SOURCE_DATE_EPOCH` environment variable when set, and to the DOS epoch (1980-01-01 00:00:00 UTC) otherwise. Override with `reproducible: { time: ... }`.
+- Permissions are fixed to 0644 for files and 0755 for directories (`reproducible: { file_permissions: ..., directory_permissions: ... }`); ownership is discarded.
+- Only allow-listed extra fields are kept (default: `[:zip64]`, added automatically when sizes require it). Unknown or gathered fields are dropped; an extra field you *explicitly* provide (via `extra:`) that is not allow-listed raises `Zip::NonReproducibleError` explaining why, as does an entry name that is not valid UTF-8.
+
+Identical output is guaranteed for the same Ruby/zlib versions and compression settings; different compressor versions may produce different (but valid) compressed streams. Encryption is not reproducible and is rejected when this option is enabled.
+
 ### Zipping a directory recursively
 
 `Zip::File#add_recursive` adds the contents of a directory (not the directory itself) to an archive, recursing into subdirectories:
