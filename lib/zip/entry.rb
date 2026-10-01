@@ -35,9 +35,23 @@ module Zip
 
     attr_writer :size # :nodoc:
 
-    mark_dirty :comment=, :compressed_size=, :external_file_attributes=,
-               :fstype=, :gp_flags=, :name=, :size=,
+    mark_dirty :compressed_size=, :external_file_attributes=,
+               :fstype=, :gp_flags=, :size=,
                :unix_gid=, :unix_perms=, :unix_uid=
+
+    # Setting the name or comment also has to keep the Unicode extra fields
+    # (and their CRCs) in sync, so these setters are defined explicitly.
+    def name=(name)
+      @name_modified = true
+      @dirty = true
+      @name = name
+    end
+
+    def comment=(comment)
+      @comment_modified = true
+      @dirty = true
+      @comment = comment
+    end
 
     def set_default_vars_values # :nodoc:
       @local_header_offset      = 0
@@ -57,6 +71,13 @@ module Zip
         @version = 63
       end
       @follow_symlinks = false
+
+      # Primary (header) bytes as read, kept for lossless rewrites when a
+      # Unicode extra field authenticates a legacy-encoded field.
+      @raw_name         = nil
+      @raw_comment      = nil
+      @name_modified    = true
+      @comment_modified = true
 
       @restore_times       = DEFAULT_RESTORE_OPTIONS[:restore_times]
       @restore_permissions = DEFAULT_RESTORE_OPTIONS[:restore_permissions]
@@ -260,7 +281,7 @@ module Zip
     end
 
     def name_size # :nodoc:
-      @name ? @name.bytesize : 0
+      name_wire_bytes.bytesize
     end
 
     def extra_size # :nodoc:
@@ -268,7 +289,24 @@ module Zip
     end
 
     def comment_size # :nodoc:
-      @comment ? @comment.bytesize : 0
+      comment_wire_bytes.bytesize
+    end
+
+    # The bytes to write to the primary name field of a header. Untouched
+    # entries keep their original bytes (possibly legacy encoded and
+    # authenticated by a Unicode Path extra field); renamed entries use the
+    # UTF-8 bytes of the new name.
+    def name_wire_bytes # :nodoc:
+      return @raw_name if !@name_modified && @raw_name
+
+      @name.to_s.b
+    end
+
+    # The bytes to write to the primary comment field. See #name_wire_bytes.
+    def comment_wire_bytes # :nodoc:
+      return @raw_comment if !@comment_modified && @raw_comment
+
+      @comment.to_s.b
     end
 
     def calculate_local_header_size # :nodoc:
@@ -396,24 +434,23 @@ module Zip
 
       set_time(@last_mod_date, @last_mod_time)
 
-      @name = io.read(@name_length)
-      if ::Zip.force_entry_names_encoding
-        @name.force_encoding(::Zip.force_entry_names_encoding)
-      end
-      @name.tr!('\\', '/') # Normalise filepath separators after encoding set.
-
-      # We need to do this here because `initialize` has so many side-effects.
-      # :-(
-      @ftype = name_is_directory? ? :directory : :file
+      raw_name = io.read(@name_length)
+      @raw_name = raw_name.dup.freeze
 
       extra = io.read(@extra_length)
       if extra && extra.bytesize != @extra_length
         raise ::Zip::Error, 'Truncated local zip entry header'
       end
 
-      read_extra_field(extra, local: true)
+      read_extra_field(extra, local: true, name: raw_name)
       parse_zip64_extra(true)
       parse_aes_extra
+
+      apply_name_encoding(raw_name, local: true)
+      # We need to do this here because `initialize` has so many side-effects.
+      # :-(
+      @ftype = name_is_directory? ? :directory : :file
+
       @local_header_size = calculate_local_header_size
     end
 
@@ -434,6 +471,7 @@ module Zip
 
     def write_local_entry(io, suppress_extra_fields: false, rewrite: false) # :nodoc:
       prep_local_zip64_extra
+      prep_unicode_extra(local: true)
 
       # If we are rewriting the local header, then we verify that we haven't changed
       # its size. At this point we have to keep extra fields if they are present.
@@ -447,7 +485,7 @@ module Zip
 
       io << pack_local_entry
 
-      io << @name
+      io << name_wire_bytes
       io << @extra.to_local_bin if @extra
       @local_header_size = io.tell - @local_header_offset
     end
@@ -516,17 +554,62 @@ module Zip
     end
 
     def check_c_dir_entry_comment_size # :nodoc:
-      return if @comment && @comment.bytesize == @comment_length
+      return if @raw_comment && @raw_comment.bytesize == @comment_length
 
       raise ::Zip::Error, 'Truncated cdir zip entry header'
     end
 
-    def read_extra_field(buf, local: false) # :nodoc:
+    def read_extra_field(buf, local: false, name: nil, comment: nil) # :nodoc:
       if @extra.kind_of?(::Zip::ExtraField)
-        @extra.merge(buf, local: local) if buf
+        @extra.merge(buf, local: local, name: name, comment: comment) if buf
       else
-        @extra = ::Zip::ExtraField.new(buf, local: local)
+        @extra = ::Zip::ExtraField.new(
+          buf, local: local, name: name, comment: comment
+        )
       end
+    end
+
+    # Resolve the entry name from the raw primary name bytes, applying a
+    # trusted Unicode Path extra field, the EFS flag, or the user-forced
+    # encoding in that order.
+    def apply_name_encoding(raw_name, local:)
+      unicode_name = @extra[:unicodepath]&.unicode_value(local: local)
+      @name =
+        if unicode_name
+          unicode_name.dup
+        elsif ::Zip.force_entry_names_encoding
+          raw_name.dup.force_encoding(::Zip.force_entry_names_encoding)
+        elsif (@gp_flags & EFS) != 0
+          decode_utf8(raw_name)
+        else
+          raw_name.dup
+        end
+      @name.tr!('\\', '/') # Normalise filepath separators after encoding set.
+      @name_modified = false
+    end
+
+    # Resolve the entry comment. A trusted Unicode Comment extra field wins;
+    # otherwise the EFS flag declares the primary comment bytes to be UTF-8.
+    def apply_comment_encoding(raw_comment)
+      unicode_comment = @extra[:unicodecomment]&.unicode_value(local: false)
+      @comment =
+        if unicode_comment
+          unicode_comment.dup
+        elsif (@gp_flags & EFS) != 0
+          decode_utf8(raw_comment)
+        else
+          raw_comment.dup
+        end
+      @comment_modified = false
+    end
+
+    # Return +bytes+ tagged as UTF-8 when they really are UTF-8, otherwise
+    # leave them as BINARY rather than presenting an invalid string as UTF-8.
+    def decode_utf8(bytes)
+      tagged = bytes.dup.force_encoding(Encoding::UTF_8)
+      return tagged if tagged.valid_encoding?
+
+      bytes.dup
     end
 
     def read_c_dir_entry(io) # :nodoc:
@@ -537,15 +620,20 @@ module Zip
       check_c_dir_entry_signature
       set_time(@last_mod_date, @last_mod_time)
 
-      @name = io.read(@name_length)
-      if ::Zip.force_entry_names_encoding
-        @name.force_encoding(::Zip.force_entry_names_encoding)
-      end
-      @name.tr!('\\', '/') # Normalise filepath separators after encoding set.
+      raw_name = io.read(@name_length)
+      @raw_name = raw_name.dup.freeze
 
-      read_extra_field(io.read(@extra_length))
-      @comment = io.read(@comment_length)
+      extra = io.read(@extra_length)
+      raw_comment = io.read(@comment_length)
+      @raw_comment = raw_comment.dup.freeze
       check_c_dir_entry_comment_size
+
+      read_extra_field(extra, local: false,
+                              name: raw_name, comment: raw_comment)
+
+      apply_name_encoding(raw_name, local: false)
+      apply_comment_encoding(raw_comment)
+
       set_ftype_from_c_dir_entry
       parse_zip64_extra(false)
       parse_aes_extra
@@ -622,6 +710,7 @@ module Zip
 
     def write_c_dir_entry(io, suppress_extra_fields: false) # :nodoc:
       prep_cdir_zip64_extra
+      prep_unicode_extra(local: false)
 
       case @fstype
       when ::Zip::FSTYPE_UNIX
@@ -645,9 +734,9 @@ module Zip
       @extra.suppress_fields!(suppress_extra_fields) if suppress_extra_fields
       io << pack_c_dir_entry
 
-      io << @name
+      io << name_wire_bytes
       io << (@extra ? @extra.to_c_dir_bin : '')
-      io << @comment
+      io << comment_wire_bytes
     end
 
     def ==(other) # :nodoc:
@@ -876,6 +965,25 @@ module Zip
       when 8, 9
         @gp_flags |= COMPRESSION_LEVEL_MAX_GPFLAG
       end
+    end
+
+    # Feed the entry's primary field bytes to the Unicode extra fields before
+    # serializing, so their CRCs can be (re)computed. A renamed entry or a
+    # changed comment regenerates its field; untouched entries keep the
+    # original record bytes.
+    def prep_unicode_extra(local:) # :nodoc:
+      return unless @extra
+
+      @extra[:unicodepath]&.prepare_for_write(
+        name_wire_bytes, local: local, modified: @name_modified
+      )
+
+      # The Unicode Comment field is only defined in the central directory.
+      return if local
+
+      @extra[:unicodecomment]&.prepare_for_write(
+        comment_wire_bytes, local: false, modified: @comment_modified
+      )
     end
 
     # rubocop:disable Style/GuardClause

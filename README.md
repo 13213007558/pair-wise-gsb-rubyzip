@@ -410,6 +410,16 @@ Zip.force_entry_names_encoding = 'UTF-8'
 
 Allowed encoding names are the same as accepted by `String#force_encoding`
 
+When reading an archive, rubyzip decodes the entry name and comment from the
+Info-ZIP Unicode Path (`0x7075`) and Unicode Comment (`0x6375`) extra fields
+when they are present and valid (version `1` with a CRC matching the primary
+field bytes in the same header). These fields are used in preference to the
+primary bytes, followed by the UTF-8 language encoding flag (EFS), and finally
+`Zip.force_entry_names_encoding`. Records with an unknown version, an invalid
+CRC or invalid UTF-8 are not trusted (the primary field rules apply instead),
+but are preserved verbatim when the archive is rewritten. Renaming an entry
+(or changing its comment) regenerates the associated field with a fresh CRC.
+
 ### Date Validation
 
 Some zip files might have an invalid date format, which will raise a warning. You can hide this warning with the following setting:
