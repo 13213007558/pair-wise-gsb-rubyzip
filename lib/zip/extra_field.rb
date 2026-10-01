@@ -69,13 +69,13 @@ module Zip
     end
 
     def to_local_bin
-      ordered_values.map! { |v| v.to_local_bin.force_encoding('BINARY') }.join
+      ordered_values.map { |v| v.to_local_bin.force_encoding('BINARY') }.join
     end
 
     alias to_s to_local_bin
 
     def to_c_dir_bin
-      ordered_values.map! { |v| v.to_c_dir_bin.force_encoding('BINARY') }.join
+      ordered_values.map { |v| v.to_c_dir_bin.force_encoding('BINARY') }.join
     end
 
     def c_dir_size
@@ -85,9 +85,6 @@ module Zip
     def local_size
       to_local_bin.bytesize
     end
-
-    alias length local_size
-    alias size local_size
   end
 end
 

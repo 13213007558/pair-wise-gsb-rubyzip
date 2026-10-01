@@ -50,6 +50,17 @@ class ZipFileAddRecursiveTest < Minitest::Test
     end
   end
 
+  def test_add_directory
+    Zip::File.open(OUT_ZIP, create: true) do |zf|
+      zf.add('subdir', File.join(SRC_DIR, 'subdir'))
+    end
+
+    Zip::File.open(OUT_ZIP) do |zf|
+      entry = zf.get_entry('subdir/')
+      assert_predicate entry, :directory?
+    end
+  end
+
   def test_add_recursive_with_entry_prefix
     Zip::File.open(OUT_ZIP, create: true) do |zf|
       zf.add_recursive(SRC_DIR, prefix: 'assets')

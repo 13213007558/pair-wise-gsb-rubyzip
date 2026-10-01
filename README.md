@@ -116,6 +116,37 @@ Zip::OutputStream.open('archive.zip', suppress_extra_fields: [:ntfs, :zip64])
 
 Note that there are some extra fields that cannot be suppressed at all (e.g. `:aes`), and some which will only be suppressed if it is safe to do so (e.g. `:zip64`).
 
+### Reproducible archives
+
+Pass `reproducible: true` to `Zip::File`, `Zip::File.open_buffer`, or
+`Zip::OutputStream` to canonicalize newly written output. Entries are ordered
+by their UTF-8 name bytes, DOS modification times are set to
+`1980-01-01 00:00:00`, Unix permissions are set to `0644` for files, `0755` for
+directories, and `0777` for symlinks, and the creator filesystem is set to
+Unix.
+
+```ruby
+Zip::File.open('archive.zip', create: true, reproducible: true) do |zipfile|
+  zipfile.add('a.txt', 'a.txt')
+end
+```
+
+Entry comments are preserved but must be valid UTF-8. Archive comments are
+not part of an entry, so they are written unchanged. Known, suppressible extra
+fields are removed, including timestamp, UID/GID, and NTFS fields. Unknown
+extra fields raise `ArgumentError`, because silently dropping or reordering
+them would not preserve their meaning. Only fields required to read the
+archive are retained or generated, such as Zip64 size fields and the AES field
+for an already-formatted raw entry. Random encryption headers mean new
+traditional or AES encryption cannot be used with this option.
+
+With the same Ruby and zlib versions and the same compression method and
+level, identical entry contents and names produce byte-identical archives.
+Different compressor versions or explicitly changed compression settings are
+not expected to produce identical compressed streams. Source file mtimes,
+source permissions, and filesystem traversal/insertion order do not affect the
+result.
+
 ### Zipping a directory recursively
 
 `Zip::File#add_recursive` adds the contents of a directory (not the directory itself) to an archive, recursing into subdirectories:

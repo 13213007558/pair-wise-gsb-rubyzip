@@ -29,51 +29,68 @@ module Zip
 
     # Opens the indicated zip file. If a file with that name already
     # exists it will be overwritten.
-    def initialize(file_name, stream: false, encrypter: nil, suppress_extra_fields: false, **opts)
+    # Pass reproducible: true to canonicalize entry order, timestamps,
+    # permissions, filename encoding, and allowed extra fields.
+    def initialize(file_name, stream: false, encrypter: nil,
+                   suppress_extra_fields: false, reproducible: false, **opts)
       super(**opts)
       @file_name = file_name
-      @output_stream = if stream
-                         iostream = Zip::RUNNING_ON_WINDOWS ? @file_name : @file_name.dup
-                         iostream.reopen(@file_name)
-                         iostream.rewind
-                         iostream
-                       else
-                         ::File.new(@file_name, 'wb')
-                       end
+      @reproducible = reproducible
+      Reproducible.validate_encrypter(encrypter) if @reproducible
+      target_stream = if stream
+                        iostream = Zip::RUNNING_ON_WINDOWS ? @file_name : @file_name.dup
+                        iostream.reopen(@file_name)
+                        iostream.rewind
+                        iostream
+                      else
+                        ::File.new(@file_name, 'wb')
+                      end
+      @target_stream = target_stream
+      @output_stream = @reproducible ? new_reproducible_staging_stream : target_stream
       @cdir = ::Zip::CentralDirectory.new
       @compressor = ::Zip::NullCompressor.instance
       @encrypter = encrypter || ::Zip::NullEncrypter.new
       @suppress_extra_fields = suppress_extra_fields
+      @entry_payloads = []
       @closed = false
       @current_entry = nil
+      @current_payload_start = nil
+      @current_entry_finished = false
     end
 
     class << self
       # Same as #initialize but if a block is passed the opened
       # stream is passed to the block and closed when the block
       # returns.
-      def open(file_name, encrypter: nil, suppress_extra_fields: false, **opts)
+      # Pass reproducible: true for deterministic archive output.
+      def open(file_name, encrypter: nil, suppress_extra_fields: false,
+               reproducible: false, **opts)
         unless block_given?
           return new(
             file_name,
             encrypter:             encrypter,
             suppress_extra_fields: suppress_extra_fields,
+            reproducible:          reproducible,
             **opts
           )
         end
 
         zos = new(file_name, stream: false, encrypter: encrypter,
-                  suppress_extra_fields: suppress_extra_fields, **opts)
+                  suppress_extra_fields: suppress_extra_fields,
+                  reproducible: reproducible, **opts)
         yield zos
       ensure
         zos.close if zos
       end
 
       # Same as #open but writes to a filestream instead
-      def write_buffer(io = ::StringIO.new, encrypter: nil, suppress_extra_fields: false, **opts)
+      # Pass reproducible: true for deterministic archive output.
+      def write_buffer(io = ::StringIO.new, encrypter: nil,
+                       suppress_extra_fields: false, reproducible: false, **opts)
         io.binmode if io.respond_to?(:binmode)
         zos = new(io, stream: true, encrypter: encrypter,
-                  suppress_extra_fields: suppress_extra_fields, **opts)
+                  suppress_extra_fields: suppress_extra_fields,
+                  reproducible: reproducible, **opts)
         yield zos
         zos.close_buffer
       end
@@ -83,10 +100,7 @@ module Zip
     def close
       return if @closed
 
-      finalize_current_entry
-      update_local_headers
-      @cdir.write_to_stream(@output_stream, suppress_extra_fields: @suppress_extra_fields)
-      @output_stream.close
+      write_archive(close_output: true)
       @closed = true
     end
 
@@ -94,12 +108,10 @@ module Zip
     def close_buffer
       return @output_stream if @closed
 
-      finalize_current_entry
-      update_local_headers
-      @cdir.write_to_stream(@output_stream, suppress_extra_fields: @suppress_extra_fields)
+      write_archive(close_output: false)
       @closed = true
-      @output_stream.flush
-      @output_stream
+      @target_stream.flush
+      @target_stream
     end
 
     # Closes the current entry and opens a new for writing.
@@ -138,14 +150,18 @@ module Zip
       @cdir << entry
       src_pos = entry.local_header_offset
       entry.write_local_entry(@output_stream)
+      payload_start = @output_stream.tell
       @compressor = NullCompressor.instance
       entry.get_raw_input_stream do |is|
         is.seek(src_pos, IO::SEEK_SET)
         ::Zip::Entry.read_local_entry(is)
         IOExtras.copy_stream_n(@output_stream, is, entry.compressed_size)
       end
+      @entry_payloads << [entry, payload_start, @output_stream.tell]
       @compressor = NullCompressor.instance
       @current_entry = nil
+      @current_payload_start = nil
+      @current_entry_finished = false
     end
 
     private
@@ -153,7 +169,7 @@ module Zip
     def finalize_current_entry
       return unless @current_entry
 
-      finish
+      finish unless @current_entry_finished
       @output_stream << @encrypter.trailer unless @current_entry.directory?
       @current_entry.compressed_size = @output_stream.tell -
                                        @current_entry.local_header_offset -
@@ -166,7 +182,13 @@ module Zip
         @current_entry.size
       )
       @current_entry.gp_flags |= @encrypter.gp_flags unless @current_entry.directory?
+      payload_end = @current_entry.local_header_offset +
+                    @current_entry.calculate_local_header_size +
+                    @current_entry.compressed_size
+      @entry_payloads << [@current_entry, @current_payload_start, payload_end]
       @current_entry = nil
+      @current_payload_start = nil
+      @current_entry_finished = false
       @compressor = ::Zip::NullCompressor.instance
     end
 
@@ -176,9 +198,11 @@ module Zip
       @encrypter.prepare_entry(entry)
       @cdir << entry
       entry.write_local_entry(@output_stream, suppress_extra_fields: @suppress_extra_fields)
+      @current_payload_start = @output_stream.tell
       @encrypter.reset!
       @output_stream << @encrypter.header(entry.mtime) unless entry.directory?
       @compressor = get_compressor(entry)
+      @current_entry_finished = false
     end
 
     def check_duplicate_name(entry, proc_name)
@@ -209,10 +233,55 @@ module Zip
       @output_stream.pos = pos
     end
 
+    def new_reproducible_staging_stream
+      ::Tempfile.new('rubyzip-reproducible', binmode: true)
+    end
+
+    def write_archive(close_output:)
+      finalize_current_entry
+
+      staging_stream = @output_stream
+      if @reproducible
+        previous_zip64_setting = Zip.write_zip64_support
+        Zip.write_zip64_support = true
+        begin
+          write_reproducible_archive
+          @cdir.write_to_stream(@target_stream, suppress_extra_fields: @suppress_extra_fields)
+        ensure
+          Zip.write_zip64_support = previous_zip64_setting
+        end
+        staging_stream.close
+        staging_stream.unlink if staging_stream.respond_to?(:unlink)
+      else
+        update_local_headers
+        @cdir.write_to_stream(@target_stream, suppress_extra_fields: @suppress_extra_fields)
+      end
+      @target_stream.close if close_output
+    end
+
+    def write_reproducible_archive
+      payloads = @entry_payloads.to_h { |entry, start, finish| [entry, [start, finish]] }
+      entries = Reproducible.sorted_entries(@cdir.entries)
+      entries.each { |entry| Reproducible.normalize_entry(entry) }
+
+      @cdir = ::Zip::CentralDirectory.new(EntrySet.new(entries), @cdir.comment)
+      entries.each do |entry|
+        entry.local_header_offset = @target_stream.tell
+        entry.write_local_entry(@target_stream)
+
+        start, finish = payloads.fetch(entry)
+        @output_stream.seek(start, IO::SEEK_SET)
+        ::Zip::IOExtras.copy_stream_n(@target_stream, @output_stream, finish - start)
+      end
+    end
+
     protected
 
     def finish # :nodoc:
+      return if @current_entry_finished
+
       @compressor.finish
+      @current_entry_finished = true
     end
 
     public

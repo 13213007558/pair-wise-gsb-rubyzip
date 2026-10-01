@@ -73,6 +73,13 @@ class ZipExtraFieldTest < Minitest::Test
     assert_equal(extra.c_dir_size, extra.to_c_dir_bin.size)
   end
 
+  def test_empty_extra_field_has_zero_serialized_size
+    extra = Zip::ExtraField.new
+
+    assert_equal 0, extra.local_size
+    assert_equal 0, extra.c_dir_size
+  end
+
   def test_to_s
     str = "UT\x5\0\x3\250$\r@Ux\x04\x00\xE8\x03\xE8\x03Te\0\0testit"
     extra = ::Zip::ExtraField.new(str)
