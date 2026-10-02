@@ -134,6 +134,10 @@ module Zip
     end
   end
 
+  # Error raised when archive recovery (see Zip::Recovery) cannot proceed,
+  # for example when entries have not been confirmed before writing.
+  class RecoveryError < Error; end
+
   # Error raised if there is not enough metadata for the entry to be streamed.
   class StreamingError < Error
     # The entry that has caused this error.
