@@ -1,3 +1,7 @@
+# Unreleased
+
+- Add support for reading split (multi-volume) zip archives: `Zip::File.open_multipart` takes the caller's volumes as seekable IOs keyed by disk number and reads headers, compressed data and central directory structures that span volumes, without concatenating the volumes first. Missing volumes, duplicate volumes and out-of-range offsets raise the new, distinguishable `Zip::MissingVolumeError`, `Zip::DuplicateVolumeError` and `Zip::VolumeOffsetError`. Volume IOs stay owned by the caller and are never closed by rubyzip.
+
 # 3.7.0 (2026-09-18)
 
 - Add AES Encryption. [#678](https://github.com/rubyzip/rubyzip/pull/678)

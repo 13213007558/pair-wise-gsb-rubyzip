@@ -249,6 +249,26 @@ end
 
 As with `extract`, existing files at the destination will raise `Zip::DestinationExistsError` unless a block is passed to resolve the conflict (see [Existing Files](#existing-files) below). Symlink entries are always skipped (ignored, with a warning), rather than extracted.
 
+### Reading a split (multi-volume) Zip file
+
+Split archives — a set of files such as `foo.z01`, `foo.z02` and the final `foo.zip` — can be read with `Zip::File.open_multipart` without first concatenating the volumes into a single file. Supply each volume as a seekable IO, keyed by its zero-based disk number (`.z01` is disk 0, `.z02` is disk 1, and so on; the final `.zip` is the last disk):
+
+```ruby
+volumes = {
+  0 => File.open('foo.z01', 'rb'),
+  1 => File.open('foo.z02', 'rb'),
+  2 => File.open('foo.zip', 'rb')
+}
+
+Zip::File.open_multipart(volumes) do |zip_file|
+  zip_file.each do |entry|
+    puts entry.get_input_stream.read
+  end
+end
+```
+
+An Array of IOs in disk order also works. The volume IOs remain yours: they are never closed by rubyzip, even when the block form is used. Multi-volume archives are read-only. Structures that span volume boundaries (local headers, compressed data, the central directory and the end of central directory records, including zip64) are read transparently. If a referenced disk was not supplied a `Zip::MissingVolumeError` is raised, a disk supplied twice raises `Zip::DuplicateVolumeError`, and an offset beyond the end of the archive raises `Zip::VolumeOffsetError`.
+
 ### Reading a Zip file with `Zip::InputStream`
 
 `Zip::InputStream` can be used for faster reading of zip file content because it does not read the Central directory up front.

@@ -154,6 +154,48 @@ module Zip
         end
       end
 
+      # Like #open_buffer, but reads a split (multi-volume) zip archive
+      # from a set of volumes supplied by the caller, without
+      # concatenating them into a single file or buffer first.
+      #
+      # +volumes+ maps each disk number to a seekable IO provided by the
+      # caller (an Array of IOs in disk order, or a ready-made
+      # Zip::MultipartReader, also work). Disk numbers are zero-based:
+      # the `.z01` file is disk 0, `.z02` is disk 1, and so on, with the
+      # final `.zip` file being the last disk.
+      #
+      # The caller keeps ownership of the volume IOs: they are never
+      # closed by Zip::File, not even when the block form is used.
+      # Multi-volume archives are read-only; #commit raises Zip::Error
+      # if changes have been made.
+      def open_multipart(volumes,
+                         restore_ownership: DEFAULT_RESTORE_OPTIONS[:restore_ownership],
+                         restore_permissions: DEFAULT_RESTORE_OPTIONS[:restore_permissions],
+                         restore_times: DEFAULT_RESTORE_OPTIONS[:restore_times],
+                         compression_level: ::Zip.default_compression,
+                         suppress_extra_fields: false)
+        reader = if volumes.kind_of?(::Zip::MultipartReader)
+                   volumes
+                 else
+                   ::Zip::MultipartReader.new(volumes)
+                 end
+
+        zf = ::Zip::File.new(reader, buffer: true,
+                                     restore_ownership:     restore_ownership,
+                                     restore_permissions:   restore_permissions,
+                                     restore_times:         restore_times,
+                                     compression_level:     compression_level,
+                                     suppress_extra_fields: suppress_extra_fields)
+
+        return zf unless block_given?
+
+        begin
+          yield zf
+        ensure
+          zf.close
+        end
+      end
+
       # Iterates over the contents of the ZipFile. This is more efficient
       # than using a ZipInputStream since this methods simply iterates
       # through the entries in the central directory structure in the archive
@@ -397,6 +439,10 @@ module Zip
     # the zip archive.
     def commit
       return if name.kind_of?(StringIO) || !commit_required?
+
+      if name.kind_of?(::Zip::MultipartReader)
+        raise Error, 'Cannot commit changes to a multi-volume archive.'
+      end
 
       on_success_replace do |tmp_file|
         ::Zip::OutputStream.open(tmp_file, suppress_extra_fields: @suppress_extra_fields) do |zos|

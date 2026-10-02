@@ -125,12 +125,81 @@ module Zip
     end
   end
 
-  # Error raised if a split archive is read. Rubyzip does not support reading
-  # split archives.
+  # Error raised if a split (multi-volume) archive is read through an
+  # interface that only understands single-file archives.
   class SplitArchiveError < Error
     # The message returned by this error.
     def message
-      'Rubyzip cannot extract from split archives at this time.'
+      'This archive is split across multiple volumes. ' \
+        'Use Zip::File.open_multipart, supplying every volume, to read it.'
+    end
+  end
+
+  # The superclass for errors specific to reading multi-volume (split)
+  # archives. Rescue this one if you don't need to know exactly what went
+  # wrong with the volume set.
+  class MultipartError < Error; end
+
+  # Error raised when an archive references a disk (volume) that was not
+  # supplied by the caller.
+  class MissingVolumeError < MultipartError
+    # The disk number that is missing.
+    attr_reader :disk_number
+
+    # Create a new MissingVolumeError with the missing disk number and,
+    # optionally, the number of volumes that were actually provided.
+    def initialize(disk_number, available_count = nil)
+      super()
+      @disk_number     = disk_number
+      @available_count = available_count
+    end
+
+    # The message returned by this error.
+    def message
+      if @available_count
+        "Disk #{@disk_number} is missing: the archive references it, but " \
+          "only #{@available_count} volume(s) were provided."
+      else
+        "Disk #{@disk_number} is missing from the provided volumes."
+      end
+    end
+  end
+
+  # Error raised when a volume is supplied more than once for the same
+  # disk number.
+  class DuplicateVolumeError < MultipartError
+    # The disk number that was supplied more than once.
+    attr_reader :disk_number
+
+    # Create a new DuplicateVolumeError with the duplicated disk number.
+    def initialize(disk_number)
+      super()
+      @disk_number = disk_number
+    end
+
+    # The message returned by this error.
+    def message
+      "Disk #{@disk_number} was provided more than once."
+    end
+  end
+
+  # Error raised when a seek lands outside the concatenated archive.
+  class VolumeOffsetError < MultipartError
+    # The out-of-range offset, and the total size of the archive.
+    attr_reader :offset, :size
+
+    # Create a new VolumeOffsetError with the offending offset and the
+    # total size of the concatenated archive.
+    def initialize(offset, size)
+      super()
+      @offset = offset
+      @size   = size
+    end
+
+    # The message returned by this error.
+    def message
+      "Offset #{@offset} is out of range: " \
+        "the concatenated archive is #{@size} bytes."
     end
   end
 

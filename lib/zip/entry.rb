@@ -33,6 +33,11 @@ module Zip
 
     attr_reader :extra, :compression_level, :filepath # :nodoc:
 
+    # The number of the disk on which this entry's local header starts
+    # in a split (multi-volume) archive. Always 0 for single-file
+    # archives.
+    attr_reader :disk_number_start
+
     attr_writer :size # :nodoc:
 
     mark_dirty :comment=, :compressed_size=, :external_file_attributes=,
@@ -42,6 +47,7 @@ module Zip
     def set_default_vars_values # :nodoc:
       @local_header_offset      = 0
       @local_header_size        = nil # not known until local entry is created or read
+      @disk_number_start        = 0
       @internal_file_attributes = 1
       @external_file_attributes = 0
       @header_signature         = ::Zip::CENTRAL_DIRECTORY_ENTRY_SIGNATURE
@@ -467,7 +473,7 @@ module Zip
         @name_length,
         @extra_length,
         @comment_length,
-        _, # diskNumberStart
+        @disk_number_start,
         @internal_file_attributes,
         @external_file_attributes,
         @local_header_offset = buf.unpack('VCCvvvvvVVVvvvvvVV')
@@ -830,9 +836,10 @@ module Zip
       if for_local_header
         @size, @compressed_size = @extra[:zip64].parse(@size, @compressed_size)
       else
-        @size, @compressed_size, @local_header_offset = @extra[:zip64].parse(
-          @size, @compressed_size, @local_header_offset
-        )
+        @size, @compressed_size, @local_header_offset, @disk_number_start =
+          @extra[:zip64].parse(
+            @size, @compressed_size, @local_header_offset, @disk_number_start
+          )
       end
     end
 

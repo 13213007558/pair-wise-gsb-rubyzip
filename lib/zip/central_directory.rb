@@ -36,6 +36,7 @@ module Zip
 
     def read_from_stream(io)
       read_eocds(io)
+      @cdir_offset = flat_offset(io, @disk_with_start_of_cdir, @cdir_offset)
       read_central_directory_entries(io)
     end
 
@@ -117,8 +118,8 @@ module Zip
       size_of_zip64_e_o_c_d,
       _version_made_by,
       _version_needed_for_extract,
-      _number_of_this_disk,
-      _number_of_disk_with_start_of_cdir,
+      @number_of_this_disk,
+      @disk_with_start_of_cdir,
       _total_number_of_entries_in_cdir_on_this_disk,
       @size,
       size_in_bytes,
@@ -140,24 +141,26 @@ module Zip
 
     def unpack_64_eocd_locator(buffer) # :nodoc:
       _, # ZIP64_EOCD_LOCATOR_SIG. We know we have this at this point.
-      _, zip64_eocd_offset, = buffer.unpack('VVQ<V')
+      disk_with_zip64_eocd,
+      zip64_eocd_offset,
+      total_disks = buffer.unpack('VVQ<V')
 
-      zip64_eocd_offset
+      [disk_with_zip64_eocd, zip64_eocd_offset, total_disks]
     end
 
     # Unpack the EOCD and return a boolean indicating whether this header is
     # complete without needing Zip64 extensions.
     def unpack_e_o_c_d(buffer) # :nodoc:
       _, # END_OF_CD_SIG. We know we have this at this point.
-      number_of_this_disk,
-      number_of_disk_with_start_of_cdir,
+      @number_of_this_disk,
+      @disk_with_start_of_cdir,
       total_number_of_entries_in_cdir_on_this_disk,
       @size,
       size_in_bytes,
       @cdir_offset,
       comment_length = buffer.unpack('VvvvvVVv')
 
-      complete = !([number_of_this_disk, number_of_disk_with_start_of_cdir,
+      complete = !([@number_of_this_disk, @disk_with_start_of_cdir,
                     total_number_of_entries_in_cdir_on_this_disk, @size].any?(0xFFFF) ||
                     size_in_bytes == 0xFFFFFFFF || @cdir_offset == 0xFFFFFFFF)
 
@@ -188,6 +191,13 @@ module Zip
         entry = Entry.read_c_dir_entry(io)
         break unless entry
 
+        # The offset of an entry's local header is relative to the start
+        # of the disk on which the entry begins; translate it to a flat
+        # offset for the stream the archive is being read from. (This is
+        # a no-op for single-disk archives, where the disk number is 0.)
+        entry.local_header_offset =
+          flat_offset(io, entry.disk_number_start, entry.local_header_offset)
+
         offset = if entry.zip64?
                    entry.extra[:zip64].relative_header_offset
                  else
@@ -196,7 +206,7 @@ module Zip
 
         unless offset.nil?
           io_save = io.tell
-          io.seek(offset, IO::SEEK_SET)
+          io.seek(entry.local_header_offset, IO::SEEK_SET)
           entry.read_extra_field(read_local_extra_field(io), local: true)
           io.seek(io_save, IO::SEEK_SET)
         end
@@ -223,13 +233,22 @@ module Zip
       raise Error, 'Zip end of central directory signature not found' unless eocd_location
 
       # Parse the EOCD and return if it is complete without Zip64 extensions.
-      return if unpack_e_o_c_d(data.slice(eocd_location..-1))
+      if unpack_e_o_c_d(data.slice(eocd_location..-1))
+        validate_disks!(io)
+        return
+      end
 
       # Need to read in the Zip64 EOCD locator and then the Zip64 EOCD.
       zip64_eocd_locator = data.rindex([ZIP64_EOCD_LOCATOR_SIG].pack('V'), eocd_location)
       unless zip64_eocd_locator
         raise Error, 'Zip64 end of central directory locator signature expected but not found'
       end
+
+      zip64_disk, zip64_eocd_offset, total_disks =
+        unpack_64_eocd_locator(data.slice(zip64_eocd_locator..eocd_location))
+      raise Error, 'Zip64 end of central directory signature not found' if zip64_eocd_offset.nil?
+
+      validate_locator_disks!(io, zip64_disk, total_disks)
 
       # Do we already have the Zip64 EOCD in the data we've read?
       zip64_eocd_location = data.rindex([ZIP64_END_OF_CD_SIG].pack('V'), zip64_eocd_locator)
@@ -240,12 +259,7 @@ module Zip
           data.slice(zip64_eocd_location..zip64_eocd_locator)
         else
           # No. Read its location from the locator and then read it in.
-          zip64_eocd_location = unpack_64_eocd_locator(
-            data.slice(zip64_eocd_locator..eocd_location)
-          )
-          unless zip64_eocd_location
-            raise Error, 'Zip64 end of central directory signature not found'
-          end
+          zip64_eocd_location = flat_offset(io, zip64_disk, zip64_eocd_offset)
 
           io.seek(zip64_eocd_location, IO::SEEK_SET)
           io.read(base_location + zip64_eocd_locator - zip64_eocd_location)
@@ -253,6 +267,7 @@ module Zip
 
       # Finally, unpack the Zip64 EOCD.
       unpack_64_e_o_c_d(zip64_eocd_data)
+      validate_disks!(io)
     end
 
     def eocd_data(io)
@@ -272,6 +287,43 @@ module Zip
       raise error if Zip.validate_declared_number_of_entries
 
       warn error.message
+    end
+
+    # Translates a per-disk offset (as stored in the EOCD, the zip64
+    # locator and central directory entries of a split archive) into a
+    # flat offset when reading from a MultipartReader. On any other
+    # stream the archive must fit on a single disk, so a non-zero disk
+    # number means we have been handed one volume of a split archive.
+    def flat_offset(io, disk, offset)
+      return io.volume_offset(disk, offset) if io.respond_to?(:volume_offset)
+
+      raise SplitArchiveError if disk.positive?
+
+      offset
+    end
+
+    def validate_disks!(io)
+      if io.respond_to?(:volume_count)
+        [@number_of_this_disk, @disk_with_start_of_cdir].each do |disk|
+          next if disk < io.volume_count
+
+          raise MissingVolumeError.new(disk, io.volume_count)
+        end
+      elsif @number_of_this_disk.positive? || @disk_with_start_of_cdir.positive?
+        raise SplitArchiveError
+      end
+    end
+
+    def validate_locator_disks!(io, zip64_disk, total_disks)
+      return unless io.respond_to?(:volume_count)
+
+      if zip64_disk >= io.volume_count
+        raise MissingVolumeError.new(zip64_disk, io.volume_count)
+      end
+
+      return unless total_disks > io.volume_count
+
+      raise MissingVolumeError.new(total_disks - 1, io.volume_count)
     end
   end
 end
