@@ -457,6 +457,18 @@ Note that if you use the lower level `Zip::InputStream` interface, `rubyzip` doe
 
 ### Compression level
 
+### Supported compression methods
+
+When reading, rubyzip supports the following ZIP compression methods:
+
+* `0` - stored (no compression)
+* `8` - deflate (decoded with Zlib)
+* `9` - Deflate64 (decoded by a pure-Ruby implementation, no external
+  programs are called)
+
+Only methods `0` and `8` can currently be produced when writing archives;
+rubyzip cannot compress to Deflate64 itself.
+
 When adding entries to a zip archive you can set the compression level to trade-off compressed size against compression speed. By default this is set to the same as the underlying Zlib library's default (`Zlib::DEFAULT_COMPRESSION`), which is somewhere in the middle.
 
 You can configure the default compression level with:
