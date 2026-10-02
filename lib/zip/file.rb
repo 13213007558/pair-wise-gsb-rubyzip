@@ -154,6 +154,65 @@ module Zip
         end
       end
 
+      # Opens a multi-volume (split or spanned) zip archive for reading,
+      # where each volume (disk) of the archive is supplied by the caller
+      # as a separate seekable IO object - there is no need to concatenate
+      # the volumes into a single file first.
+      #
+      # `volumes` is either a Hash mapping disk numbers (Integers, starting
+      # at 0 for the first volume, e.g. the `.z01` file, up to the last
+      # volume, e.g. the `.zip` file) to seekable IO objects, or an
+      # already-populated Zip::MultiVolumeIO. For example:
+      #
+      #   Zip::File.open_multivolume(
+      #     {
+      #       0 => File.open('archive.z01', 'rb'),
+      #       1 => File.open('archive.z02', 'rb'),
+      #       2 => File.open('archive.zip', 'rb')
+      #     }
+      #   ) do |zip|
+      #     zip.each { |entry| puts entry.name }
+      #   end
+      #
+      # Ownership of the volume IOs remains with the caller: they are not
+      # closed when the returned Zip::File is closed (nor at the end of the
+      # block, in the block form). The caller is responsible for closing
+      # them when it is done with them.
+      #
+      # Multi-volume archives are read-only. Reads that require a volume
+      # that has not been provided raise Zip::MissingVolumeError, and
+      # offsets beyond the data covered by the provided volumes raise
+      # Zip::VolumeOffsetError.
+      def open_multivolume(volumes,
+                           restore_ownership: DEFAULT_RESTORE_OPTIONS[:restore_ownership],
+                           restore_permissions: DEFAULT_RESTORE_OPTIONS[:restore_permissions],
+                           restore_times: DEFAULT_RESTORE_OPTIONS[:restore_times],
+                           compression_level: ::Zip.default_compression,
+                           suppress_extra_fields: false)
+        multi_volume_io =
+          if volumes.kind_of?(::Zip::MultiVolumeIO)
+            volumes
+          else
+            ::Zip::MultiVolumeIO.new(volumes)
+          end
+        raise MissingVolumeError, 0 if multi_volume_io.volume_count.zero?
+
+        zf = ::Zip::File.new(multi_volume_io, buffer: true,
+                                              restore_ownership:     restore_ownership,
+                                              restore_permissions:   restore_permissions,
+                                              restore_times:         restore_times,
+                                              compression_level:     compression_level,
+                                              suppress_extra_fields: suppress_extra_fields)
+
+        return zf unless block_given?
+
+        begin
+          yield zf
+        ensure
+          zf.close
+        end
+      end
+
       # Iterates over the contents of the ZipFile. This is more efficient
       # than using a ZipInputStream since this methods simply iterates
       # through the entries in the central directory structure in the archive
@@ -397,6 +456,11 @@ module Zip
     # the zip archive.
     def commit
       return if name.kind_of?(StringIO) || !commit_required?
+
+      if name.kind_of?(::Zip::MultiVolumeIO)
+        raise Error, 'Cannot commit changes to a multi-volume archive: ' \
+                     'multi-volume archives are read-only.'
+      end
 
       on_success_replace do |tmp_file|
         ::Zip::OutputStream.open(tmp_file, suppress_extra_fields: @suppress_extra_fields) do |zos|

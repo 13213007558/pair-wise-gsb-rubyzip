@@ -31,6 +31,10 @@ module Zip
     attr_accessor :crc, :external_file_attributes, :fstype, :gp_flags,
                   :internal_file_attributes, :local_header_offset # :nodoc:
 
+    # The number of the disk on which this entry's local header starts, in
+    # a split (multi-volume) archive. Always 0 in a single-volume archive.
+    attr_reader :disk_number_start
+
     attr_reader :extra, :compression_level, :filepath # :nodoc:
 
     attr_writer :size # :nodoc:
@@ -41,6 +45,7 @@ module Zip
 
     def set_default_vars_values # :nodoc:
       @local_header_offset      = 0
+      @disk_number_start        = 0
       @local_header_size        = nil # not known until local entry is created or read
       @internal_file_attributes = 1
       @external_file_attributes = 0
@@ -343,6 +348,8 @@ module Zip
         entry = new(path)
         entry.read_c_dir_entry(io)
         entry
+      rescue MissingVolumeError, VolumeOffsetError
+        raise
       rescue Error
         nil
       end
@@ -351,7 +358,7 @@ module Zip
         entry = new(io)
         entry.read_local_entry(io)
         entry
-      rescue SplitArchiveError
+      rescue SplitArchiveError, MissingVolumeError, VolumeOffsetError
         raise
       rescue Error
         nil
@@ -467,7 +474,7 @@ module Zip
         @name_length,
         @extra_length,
         @comment_length,
-        _, # diskNumberStart
+        @disk_number_start,
         @internal_file_attributes,
         @external_file_attributes,
         @local_header_offset = buf.unpack('VCCvvvvvVVVvvvvvVV')
@@ -830,9 +837,10 @@ module Zip
       if for_local_header
         @size, @compressed_size = @extra[:zip64].parse(@size, @compressed_size)
       else
-        @size, @compressed_size, @local_header_offset = @extra[:zip64].parse(
-          @size, @compressed_size, @local_header_offset
-        )
+        @size, @compressed_size, @local_header_offset, @disk_number_start =
+          @extra[:zip64].parse(
+            @size, @compressed_size, @local_header_offset, @disk_number_start
+          )
       end
     end
 

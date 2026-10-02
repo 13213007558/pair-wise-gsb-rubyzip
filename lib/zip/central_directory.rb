@@ -140,7 +140,7 @@ module Zip
 
     def unpack_64_eocd_locator(buffer) # :nodoc:
       _, # ZIP64_EOCD_LOCATOR_SIG. We know we have this at this point.
-      _, zip64_eocd_offset, = buffer.unpack('VVQ<V')
+      _, zip64_eocd_offset, @total_disks = buffer.unpack('VVQ<V')
 
       zip64_eocd_offset
     end
@@ -162,6 +162,10 @@ module Zip
                     size_in_bytes == 0xFFFFFFFF || @cdir_offset == 0xFFFFFFFF)
 
       validate_size!(@size, size_in_bytes) if complete
+
+      # The total number of disks the archive spans. Only meaningful once
+      # the record is known to be complete (no Zip64 markers).
+      @total_disks = number_of_this_disk + 1 if complete
 
       @comment = if comment_length.positive?
                    buffer.slice(STATIC_EOCD_SIZE, comment_length)
@@ -220,10 +224,16 @@ module Zip
       base_location, data = eocd_data(io)
 
       eocd_location = data.rindex([END_OF_CD_SIG].pack('V'))
-      raise Error, 'Zip end of central directory signature not found' unless eocd_location
+      unless eocd_location
+        check_missing_volume!(io)
+        raise Error, 'Zip end of central directory signature not found'
+      end
 
       # Parse the EOCD and return if it is complete without Zip64 extensions.
-      return if unpack_e_o_c_d(data.slice(eocd_location..-1))
+      if unpack_e_o_c_d(data.slice(eocd_location..-1))
+        check_volumes!(io)
+        return
+      end
 
       # Need to read in the Zip64 EOCD locator and then the Zip64 EOCD.
       zip64_eocd_locator = data.rindex([ZIP64_EOCD_LOCATOR_SIG].pack('V'), eocd_location)
@@ -253,6 +263,30 @@ module Zip
 
       # Finally, unpack the Zip64 EOCD.
       unpack_64_e_o_c_d(zip64_eocd_data)
+      check_volumes!(io)
+    end
+
+    # If the archive is being read through a MultiVolumeIO, make sure that
+    # every disk the EOCD (or Zip64 locator) says the archive spans has
+    # actually been provided, so that a missing volume is reported as such
+    # rather than as a generic read or seek failure later on.
+    def check_volumes!(io) # :nodoc:
+      return unless io.respond_to?(:volume?)
+      return unless @total_disks
+
+      (0...@total_disks).each do |disk_number|
+        raise MissingVolumeError, disk_number unless io.volume?(disk_number)
+      end
+    end
+
+    # If the EOCD could not be found in the data read from a
+    # MultiVolumeIO, and a disk in the middle of the provided sequence is
+    # missing, the EOCD is most likely on an unprovided disk - say so.
+    def check_missing_volume!(io) # :nodoc:
+      return unless io.respond_to?(:first_missing_disk)
+
+      missing = io.first_missing_disk
+      raise MissingVolumeError, missing if missing
     end
 
     def eocd_data(io)

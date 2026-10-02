@@ -134,6 +134,61 @@ module Zip
     end
   end
 
+  # Error raised when a read or seek on a multi-volume archive requires a
+  # volume (disk) that the caller has not provided. See Zip::MultiVolumeIO.
+  class MissingVolumeError < Error
+    # The disk number of the volume that is missing.
+    attr_reader :disk_number
+
+    # Create a new MissingVolumeError with the specified disk number.
+    def initialize(disk_number)
+      super()
+      @disk_number = disk_number
+    end
+
+    # The message returned by this error.
+    def message
+      "Volume (disk) #{@disk_number} of the archive has not been provided."
+    end
+  end
+
+  # Error raised when a volume is added for a disk number that already has
+  # a volume. See Zip::MultiVolumeIO.
+  class DuplicateVolumeError < Error
+    # The disk number that was specified twice.
+    attr_reader :disk_number
+
+    # Create a new DuplicateVolumeError with the specified disk number.
+    def initialize(disk_number)
+      super()
+      @disk_number = disk_number
+    end
+
+    # The message returned by this error.
+    def message
+      "A volume for disk #{@disk_number} has already been provided."
+    end
+  end
+
+  # Error raised when an offset lies outside the data covered by the
+  # provided volumes of a multi-volume archive. See Zip::MultiVolumeIO.
+  class VolumeOffsetError < Error
+    # The offset that is out of range.
+    attr_reader :offset
+
+    # Create a new VolumeOffsetError with the specified offset.
+    def initialize(offset)
+      super()
+      @offset = offset
+    end
+
+    # The message returned by this error.
+    def message
+      "Offset #{@offset} is outside the data covered by the provided " \
+        'volumes. A volume may be missing, or the archive may be corrupt.'
+    end
+  end
+
   # Error raised if there is not enough metadata for the entry to be streamed.
   class StreamingError < Error
     # The entry that has caused this error.
