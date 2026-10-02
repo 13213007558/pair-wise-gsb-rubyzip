@@ -271,6 +271,24 @@ end # The `InputStream` is closed at the end of the block.
 
 Any attempt to move about in a zip file opened with `Zip::InputStream` could result in the incorrect entry being accessed and/or Zlib buffer errors. If you need random access in a zip file, use `Zip::File`.
 
+### Recovering entries from an archive that lost its central directory
+
+If an archive was truncated (for example, during an upload) so that its central directory is missing but the local entries are still present, `Zip::Recovery` can inspect what remains. It scans the local entries in order, verifies each one — deflate stream end, CRC, sizes and any data descriptor must all agree — and reports a name, byte boundaries, a status and the evidence for every entry. Stored entries whose sizes only exist in a data descriptor have no determinable boundary, so they are reported as failures rather than guessed at.
+
+Nothing is written unless you explicitly confirm which entries to keep; the confirmed entries are then written to a *new* zip file. The source archive is only ever read, never modified.
+
+```ruby
+report = Zip::Recovery.scan('broken.zip')
+report.entries.each do |entry|
+  puts "#{entry.name}: #{entry.status}"
+  puts "  evidence: #{entry.evidence.join(', ')}" unless entry.evidence.empty?
+  puts "  failure: #{entry.failure}" if entry.failure
+end
+
+confirmed = report.recoverable_entries.map(&:name) # review, then confirm
+Zip::Recovery.recover('broken.zip', 'recovered.zip', confirm: confirmed)
+```
+
 ### Encryption and Password Protection (experimental)
 
 Rubyzip supports reading and writing zip files with AES encryption (reading: version 3.1 and later; writing: version 3.7 and later), and reading and writing zip files with traditional zip encryption (a.k.a. "ZipCrypto"). Encryption is currently only available with the stream API, with either files or buffers, e.g.:
