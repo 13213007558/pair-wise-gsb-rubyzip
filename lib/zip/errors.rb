@@ -25,11 +25,11 @@ module Zip
 
   # Error raised if there is a problem while decompressing an archive entry.
   class DecompressionError < Error
-    # The error from the underlying Zlib library that caused this error.
+    # The error from the underlying decompression library that caused this
+    # error.
     attr_reader :zlib_error
 
-    # Create a new DecompressionError with the specified underlying Zlib
-    # error.
+    # Create a new DecompressionError with the specified underlying error.
     def initialize(zlib_error)
       super()
       @zlib_error = zlib_error
@@ -37,7 +37,11 @@ module Zip
 
     # The message returned by this error.
     def message
-      "Zlib error ('#{@zlib_error.message}') while inflating."
+      if @zlib_error.is_a?(::Zlib::Error)
+        "Zlib error ('#{@zlib_error.message}') while inflating."
+      else
+        "'#{@zlib_error.message}' while inflating."
+      end
     end
   end
 
