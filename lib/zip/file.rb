@@ -442,6 +442,11 @@ module Zip
     # is found, unless Zip.allow_duplicate_entry_names is on, in which case
     # it returns an Array of every entry matching that name (empty if there
     # are none). See also get_entry
+    #
+    # Entries are matched by their raw (on-disk) name bytes first; if
+    # nothing matches, the entries' Unicode display names are tried, so
+    # e.g. an entry stored with CP437 name bytes can be found by its
+    # transcoded name. See Zip::Entry#name and Zip::Entry#raw_name.
     def find_entry(entry_name)
       selected_entry = @cdir.find_entry(entry_name)
       if Zip.allow_duplicate_entry_names

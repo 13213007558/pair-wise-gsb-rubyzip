@@ -183,7 +183,7 @@ module Zip
 
     def check_duplicate_name(entry, proc_name)
       return if Zip.allow_duplicate_entry_names
-      return unless @cdir.include?(entry.name)
+      return unless @cdir.include?(entry)
 
       raise EntryExistsError.new(proc_name, entry.name)
     end

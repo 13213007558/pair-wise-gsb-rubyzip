@@ -24,7 +24,7 @@ module Zip
     COMPRESSION_LEVEL_FAST_GPFLAG = 0b100      # :nodoc:
     COMPRESSION_LEVEL_MAX_GPFLAG = 0b010       # :nodoc:
 
-    attr_accessor :comment, :compressed_size, :follow_symlinks, :name,
+    attr_accessor :comment, :compressed_size, :follow_symlinks,
                   :restore_ownership, :restore_permissions, :restore_times,
                   :unix_gid, :unix_perms, :unix_uid
 
@@ -36,8 +36,21 @@ module Zip
     attr_writer :size # :nodoc:
 
     mark_dirty :comment=, :compressed_size=, :external_file_attributes=,
-               :fstype=, :gp_flags=, :name=, :size=,
+               :fstype=, :gp_flags=, :size=,
                :unix_gid=, :unix_perms=, :unix_uid=
+
+    # The entry's user-facing Unicode name. When an entry is read from an
+    # archive this is resolved from the raw name bytes, the EFS general
+    # purpose flag and any Info-ZIP Unicode Path extra field (see
+    # ExtraField::UnicodePath); see #raw_name for the original bytes.
+    attr_reader :name
+
+    # The entry's name exactly as stored in the archive it was read from
+    # (a BINARY-encoded String), before any character set conversion.
+    # This is what gets written back to the archive when the entry is
+    # copied unrenamed. +nil+ for entries created in memory, or after an
+    # explicit rename (see #name=).
+    attr_reader :raw_name
 
     def set_default_vars_values # :nodoc:
       @local_header_offset      = 0
@@ -51,6 +64,7 @@ module Zip
 
       @ftype           = nil          # unspecified or unknown
       @filepath        = nil
+      @raw_name        = nil
       @gp_flags        = 0
       if ::Zip.unicode_names
         @gp_flags |= EFS
@@ -70,6 +84,19 @@ module Zip
     def check_name(name) # :nodoc:
       raise EntryNameError, name if name.start_with?('/')
       raise EntryNameError if name.length > 65_535
+    end
+
+    # Sets the entry's name. The new name is stored in the archive as
+    # UTF-8 with the EFS (language encoding) general purpose flag set, and
+    # any Info-ZIP Unicode Path extra field is dropped, since the header
+    # name is now itself Unicode. The original raw name bytes (see
+    # #raw_name) are forgotten.
+    def name=(new_name)
+      @dirty = true
+      @raw_name = nil
+      @name = new_name
+      @gp_flags |= EFS
+      @extra.delete(:unicodepath) if @extra.kind_of?(::Zip::ExtraField)
     end
 
     # Create a new Zip::Entry.
@@ -260,7 +287,14 @@ module Zip
     end
 
     def name_size # :nodoc:
-      @name ? @name.bytesize : 0
+      name_bytes ? name_bytes.bytesize : 0
+    end
+
+    # The bytes to write as this entry's name: the original raw bytes if
+    # the entry was read from an archive and never renamed, otherwise the
+    # current name.
+    def name_bytes # :nodoc:
+      @raw_name || @name
     end
 
     def extra_size # :nodoc:
@@ -396,22 +430,19 @@ module Zip
 
       set_time(@last_mod_date, @last_mod_time)
 
-      @name = io.read(@name_length)
-      if ::Zip.force_entry_names_encoding
-        @name.force_encoding(::Zip.force_entry_names_encoding)
-      end
-      @name.tr!('\\', '/') # Normalise filepath separators after encoding set.
-
-      # We need to do this here because `initialize` has so many side-effects.
-      # :-(
-      @ftype = name_is_directory? ? :directory : :file
-
+      @raw_name = io.read(@name_length)
       extra = io.read(@extra_length)
       if extra && extra.bytesize != @extra_length
         raise ::Zip::Error, 'Truncated local zip entry header'
       end
 
       read_extra_field(extra, local: true)
+      @name = resolve_display_name
+
+      # We need to do this here because `initialize` has so many side-effects.
+      # :-(
+      @ftype = name_is_directory? ? :directory : :file
+
       parse_zip64_extra(true)
       parse_aes_extra
       @local_header_size = calculate_local_header_size
@@ -447,7 +478,7 @@ module Zip
 
       io << pack_local_entry
 
-      io << @name
+      io << name_bytes
       io << @extra.to_local_bin if @extra
       @local_header_size = io.tell - @local_header_offset
     end
@@ -537,13 +568,9 @@ module Zip
       check_c_dir_entry_signature
       set_time(@last_mod_date, @last_mod_time)
 
-      @name = io.read(@name_length)
-      if ::Zip.force_entry_names_encoding
-        @name.force_encoding(::Zip.force_entry_names_encoding)
-      end
-      @name.tr!('\\', '/') # Normalise filepath separators after encoding set.
-
+      @raw_name = io.read(@name_length)
       read_extra_field(io.read(@extra_length))
+      @name = resolve_display_name
       @comment = io.read(@comment_length)
       check_c_dir_entry_comment_size
       set_ftype_from_c_dir_entry
@@ -645,7 +672,7 @@ module Zip
       @extra.suppress_fields!(suppress_extra_fields) if suppress_extra_fields
       io << pack_c_dir_entry
 
-      io << @name
+      io << name_bytes
       io << (@extra ? @extra.to_c_dir_bin : '')
       io << @comment
     end
@@ -759,6 +786,31 @@ module Zip
     end
 
     private
+
+    # Works out the user-facing Unicode name for this entry from the raw
+    # name bytes, the EFS general purpose flag and any Info-ZIP Unicode
+    # Path extra field. The raw bytes are kept in @raw_name, untouched, so
+    # that an entry which is never renamed is written back to the archive
+    # exactly as it was read.
+    def resolve_display_name # :nodoc:
+      if ::Zip.force_entry_names_encoding
+        return @raw_name.dup
+                        .force_encoding(::Zip.force_entry_names_encoding)
+                        .tr('\\', '/')
+      end
+
+      unicode_path = @extra[:unicodepath] if @extra.kind_of?(::Zip::ExtraField)
+      if unicode_path && (unicode_name = unicode_path.name_for(@raw_name))
+        return unicode_name.tr('\\', '/')
+      end
+
+      utf8_name = @raw_name.dup.force_encoding(Encoding::UTF_8)
+      return utf8_name.tr('\\', '/') if utf8_name.valid_encoding?
+
+      # The bytes are not valid UTF-8, so interpret them as CP437 - the
+      # zip format's default character set when the EFS flag is not set.
+      @raw_name.encode(Encoding::UTF_8, Encoding::CP437).tr('\\', '/')
+    end
 
     def read_local_header_fields(io) # :nodoc:
       static_sized_fields_buf = io.read(::Zip::LOCAL_ENTRY_STATIC_HEADER_LENGTH) || ''

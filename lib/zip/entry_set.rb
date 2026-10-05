@@ -23,6 +23,7 @@ module Zip
     # none).
     def find_entry(entry)
       bucket = @entry_set[to_key(entry)]
+      bucket ||= find_by_display_name(entry) unless entry.kind_of?(::Zip::Entry)
       return bucket&.first unless ::Zip.allow_duplicate_entry_names
 
       # Return a copy, not the live bucket, so callers iterating the result
@@ -99,7 +100,8 @@ module Zip
     end
 
     def parent(entry)
-      bucket = @entry_set[to_key(entry.parent_as_string)]
+      parent_name = entry.parent_as_string
+      bucket = @entry_set[to_key(parent_name)] || find_by_display_name(parent_name)
       return bucket&.first unless ::Zip.allow_duplicate_entry_names
 
       bucket ? bucket.dup : []
@@ -123,9 +125,28 @@ module Zip
     private
 
     def to_key(entry)
-      k = entry.to_s.chomp('/')
+      # Entries read from an archive are keyed by their raw name bytes, so
+      # that two entries whose names differ on disk but normalise to the
+      # same Unicode display name don't overwrite each other here.
+      k = entry.kind_of?(::Zip::Entry) && entry.raw_name ? entry.raw_name : entry.to_s
+      k = k.chomp('/')
       k.downcase! if ::Zip.case_insensitive_match
       k
+    end
+
+    # Fallback for name-based lookups that don't match any raw name key:
+    # compare against the entries' Unicode display names, so that e.g. an
+    # entry stored with CP437 name bytes can still be found by its
+    # transcoded name.
+    def find_by_display_name(name)
+      key = name.to_s.chomp('/')
+      key = key.downcase if ::Zip.case_insensitive_match
+      matches = entries.select do |entry|
+        display = entry.name.chomp('/')
+        display = display.downcase if ::Zip.case_insensitive_match
+        display == key
+      end
+      matches.empty? ? nil : matches
     end
   end
 end
