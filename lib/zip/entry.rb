@@ -24,19 +24,26 @@ module Zip
     COMPRESSION_LEVEL_FAST_GPFLAG = 0b100      # :nodoc:
     COMPRESSION_LEVEL_MAX_GPFLAG = 0b010       # :nodoc:
 
-    attr_accessor :comment, :compressed_size, :follow_symlinks, :name,
+    attr_accessor :comment, :compressed_size, :follow_symlinks,
                   :restore_ownership, :restore_permissions, :restore_times,
                   :unix_gid, :unix_perms, :unix_uid
 
     attr_accessor :crc, :external_file_attributes, :fstype, :gp_flags,
                   :internal_file_attributes, :local_header_offset # :nodoc:
 
-    attr_reader :extra, :compression_level, :filepath # :nodoc:
+    attr_reader :extra, :compression_level, :filepath, :name # :nodoc:
+
+    # The entry name bytes exactly as they are stored in the archive this
+    # entry was read from, before any Unicode translation (a BINARY-encoded
+    # String). This is what gets written back to the archive if the entry
+    # is not renamed. +nil+ if the entry was created rather than read from
+    # an archive, or if it has been renamed since it was read.
+    attr_reader :raw_name
 
     attr_writer :size # :nodoc:
 
     mark_dirty :comment=, :compressed_size=, :external_file_attributes=,
-               :fstype=, :gp_flags=, :name=, :size=,
+               :fstype=, :gp_flags=, :size=,
                :unix_gid=, :unix_perms=, :unix_uid=
 
     def set_default_vars_values # :nodoc:
@@ -70,6 +77,25 @@ module Zip
     def check_name(name) # :nodoc:
       raise EntryNameError, name if name.start_with?('/')
       raise EntryNameError if name.length > 65_535
+    end
+
+    # Sets the entry name, i.e. renames the entry. The new name is written
+    # to the standard name field on the next commit (in UTF-8, setting the
+    # EFS flag, if it is not ASCII-only), and any Info-ZIP Unicode Path
+    # extra field is removed, as it would no longer match the stored name.
+    # Entries that are never renamed keep the exact name representation
+    # they were read with (see #raw_name).
+    def name=(new_name)
+      @dirty = true
+      @name = new_name
+      @raw_name = nil
+      @extra&.delete(:unicodepath)
+      if new_name.ascii_only? && !::Zip.unicode_names
+        @gp_flags &= ~EFS
+      else
+        @gp_flags |= EFS
+        @version = 63 if @version < 63
+      end
     end
 
     # Create a new Zip::Entry.
@@ -260,7 +286,14 @@ module Zip
     end
 
     def name_size # :nodoc:
-      @name ? @name.bytesize : 0
+      name_to_write.bytesize
+    end
+
+    # The name bytes to store in the archive. Entries read from an archive
+    # keep their original name representation (#raw_name) unless they have
+    # been explicitly renamed since (which clears #raw_name).
+    def name_to_write # :nodoc:
+      @raw_name || @name || ''
     end
 
     def extra_size # :nodoc:
@@ -396,11 +429,8 @@ module Zip
 
       set_time(@last_mod_date, @last_mod_time)
 
-      @name = io.read(@name_length)
-      if ::Zip.force_entry_names_encoding
-        @name.force_encoding(::Zip.force_entry_names_encoding)
-      end
-      @name.tr!('\\', '/') # Normalise filepath separators after encoding set.
+      @raw_name = io.read(@name_length)
+      @name = decode_name(@raw_name)
 
       # We need to do this here because `initialize` has so many side-effects.
       # :-(
@@ -447,7 +477,7 @@ module Zip
 
       io << pack_local_entry
 
-      io << @name
+      io << name_to_write
       io << @extra.to_local_bin if @extra
       @local_header_size = io.tell - @local_header_offset
     end
@@ -527,6 +557,45 @@ module Zip
       else
         @extra = ::Zip::ExtraField.new(buf, local: local)
       end
+      apply_unicode_path_extra
+    end
+
+    # Translate the raw name bytes read from an archive header into the
+    # user-facing entry name. The EFS general-purpose flag means the bytes
+    # are UTF-8; an explicit ::Zip.force_entry_names_encoding setting takes
+    # precedence over that. Otherwise the bytes are used as-is (and a
+    # Unicode Path extra field, if present and valid, is applied later -
+    # see #apply_unicode_path_extra).
+    def decode_name(raw_name) # :nodoc:
+      name = raw_name.dup
+      if ::Zip.force_entry_names_encoding
+        name.force_encoding(::Zip.force_entry_names_encoding)
+      elsif @gp_flags & EFS == EFS
+        name.force_encoding(Encoding::UTF_8)
+      end
+      # Normalise filepath separators after encoding set. The guard avoids
+      # raising on invalid byte sequences in the string's encoding.
+      name.tr!('\\', '/') if name.include?('\\') && name.valid_encoding?
+      name
+    end
+
+    # Adopt the UTF-8 name from an Info-ZIP Unicode Path extra field
+    # (0x7075) as the user-facing name, but only if the field's CRC matches
+    # the raw name bytes from the standard name field and the stored name
+    # is valid UTF-8. The raw bytes are always kept in #raw_name and are
+    # what gets written back unless the entry is explicitly renamed.
+    def apply_unicode_path_extra # :nodoc:
+      return if @raw_name.nil? || @gp_flags & EFS == EFS
+      return unless @extra.kind_of?(::Zip::ExtraField)
+
+      unicode_path = @extra[:unicodepath]
+      return unless unicode_path
+
+      unicode_name = unicode_path.name_for(@raw_name)
+      return unless unicode_name
+
+      unicode_name.tr!('\\', '/') if unicode_name.include?('\\')
+      @name = unicode_name
     end
 
     def read_c_dir_entry(io) # :nodoc:
@@ -537,11 +606,8 @@ module Zip
       check_c_dir_entry_signature
       set_time(@last_mod_date, @last_mod_time)
 
-      @name = io.read(@name_length)
-      if ::Zip.force_entry_names_encoding
-        @name.force_encoding(::Zip.force_entry_names_encoding)
-      end
-      @name.tr!('\\', '/') # Normalise filepath separators after encoding set.
+      @raw_name = io.read(@name_length)
+      @name = decode_name(@raw_name)
 
       read_extra_field(io.read(@extra_length))
       @comment = io.read(@comment_length)
@@ -645,7 +711,7 @@ module Zip
       @extra.suppress_fields!(suppress_extra_fields) if suppress_extra_fields
       io << pack_c_dir_entry
 
-      io << @name
+      io << name_to_write
       io << (@extra ? @extra.to_c_dir_bin : '')
       io << @comment
     end

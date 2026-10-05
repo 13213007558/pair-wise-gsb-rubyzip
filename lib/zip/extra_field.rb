@@ -94,6 +94,7 @@ end
 require 'zip/extra_field/unknown'
 require 'zip/extra_field/generic'
 require 'zip/extra_field/universal_time'
+require 'zip/extra_field/unicode_path'
 require 'zip/extra_field/old_unix'
 require 'zip/extra_field/unix'
 require 'zip/extra_field/zip64'
