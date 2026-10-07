@@ -96,6 +96,33 @@ end
 
 You can generate a Zip archive in memory using `Zip::OutputStream.write_buffer`.
 
+### Compressing a large entry in parallel
+
+Member-level parallelism cannot help when an archive contains one very large
+member. Pass `parallel_compression: true` to compress that member in
+independent chunks and concatenate them into one standard raw deflate stream.
+`deflate_chunk_size` sets the input chunk size, and `compression_workers`
+limits worker count and, by default, the number of completed chunks retained
+waiting to be written. Pass `max_pending_chunks` to control that backpressure
+limit independently. The chunks use independent dictionaries, so compression
+may be slightly worse at chunk boundaries, but ordinary ZIP readers can
+inflate the result normally.
+
+```ruby
+Zip::OutputStream.open('large.zip',
+                      parallel_compression: true,
+                      deflate_chunk_size: 4 * 1024 * 1024,
+                      compression_workers: 4) do |zos|
+  zos.put_next_entry('large.bin')
+  IO.copy_stream(IO.open('large.bin', 'rb'), zos)
+end
+```
+
+Set `compression_workers: 1` to run the same chunk ordering and stream
+composition logic without threads. For a custom executor, pass an object that
+responds to `post(&job)` and returns a future responding to `value`. It may
+also implement `cancel(futures)` and `shutdown`.
+
 ### Suppressing extra fields
 
 If you wish to suppress extra fields from being added to your entries, you can do so by passing the `suppress_extra_fields` parameter to any of the archive opening calls within `Zip::File` or `Zip::OutputStream`, e.g.:

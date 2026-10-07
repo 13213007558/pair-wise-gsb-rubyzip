@@ -27,9 +27,17 @@ module Zip
 
     def_delegators :@cdir, :comment, :comment=
 
-    # Opens the indicated zip file. If a file with that name already
-    # exists it will be overwritten.
-    def initialize(file_name, stream: false, encrypter: nil, suppress_extra_fields: false, **opts)
+    # Opens the indicated zip file. If a file with that name already exists
+    # it will be overwritten. When +parallel_compression+ is true, deflated
+    # entries are compressed in input chunks and composed into one raw deflate
+    # stream. +deflate_chunk_size+, +compression_workers+ and
+    # +max_pending_chunks+ control chunk size, concurrency and backpressure;
+    # +compression_executor+ may provide a custom executor responding to
+    # +post(&job)+ or +call(&job)+.
+    def initialize(file_name, stream: false, encrypter: nil, suppress_extra_fields: false,
+                   parallel_compression: false, deflate_chunk_size: nil,
+                   compression_workers: nil, compression_executor: nil,
+                   max_pending_chunks: nil, **opts)
       super(**opts)
       @file_name = file_name
       @output_stream = if stream
@@ -44,14 +52,18 @@ module Zip
       @compressor = ::Zip::NullCompressor.instance
       @encrypter = encrypter || ::Zip::NullEncrypter.new
       @suppress_extra_fields = suppress_extra_fields
+      @parallel_compression  = parallel_compression
+      @deflate_chunk_size    = deflate_chunk_size
+      @compression_workers   = compression_workers
+      @compression_executor  = compression_executor
+      @max_pending_chunks    = max_pending_chunks
       @closed = false
       @current_entry = nil
     end
 
     class << self
-      # Same as #initialize but if a block is passed the opened
-      # stream is passed to the block and closed when the block
-      # returns.
+      # Same as #initialize but if a block is passed the opened stream is
+      # passed to the block and closed when the block returns.
       def open(file_name, encrypter: nil, suppress_extra_fields: false, **opts)
         unless block_given?
           return new(
@@ -69,7 +81,7 @@ module Zip
         zos.close if zos
       end
 
-      # Same as #open but writes to a filestream instead
+      # Same as #open but writes to a filestream instead.
       def write_buffer(io = ::StringIO.new, encrypter: nil, suppress_extra_fields: false, **opts)
         io.binmode if io.respond_to?(:binmode)
         zos = new(io, stream: true, encrypter: encrypter,
@@ -191,7 +203,20 @@ module Zip
     def get_compressor(entry)
       case entry.compression_method
       when Entry::DEFLATED
-        ::Zip::Deflater.new(@output_stream, entry.compression_level, @encrypter)
+        if @parallel_compression
+          options = {}
+          options[:chunk_size] = @deflate_chunk_size unless @deflate_chunk_size.nil?
+          options[:max_workers] = @compression_workers unless @compression_workers.nil?
+          options[:executor] = @compression_executor unless @compression_executor.nil?
+          unless @max_pending_chunks.nil?
+            options[:max_pending_chunks] = @max_pending_chunks
+          end
+          ::Zip::ParallelDeflater.new(
+            @output_stream, entry.compression_level, @encrypter, **options
+          )
+        else
+          ::Zip::Deflater.new(@output_stream, entry.compression_level, @encrypter)
+        end
       when Entry::STORED
         ::Zip::PassThruCompressor.new(@output_stream, @encrypter)
       else

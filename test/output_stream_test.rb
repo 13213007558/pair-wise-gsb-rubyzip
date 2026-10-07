@@ -111,6 +111,26 @@ class ZipOutputStreamTest < Minitest::Test
     assert_test_zip_contents(TEST_ZIP)
   end
 
+  def test_parallel_compression_writes_a_stream_that_current_reader_inflates
+    data = ('abcdefghijklmnopqrstuvwxyz' * 1000).b
+    buffer = ::Zip::OutputStream.write_buffer(
+      parallel_compression: true,
+      deflate_chunk_size: 4096,
+      compression_workers: 2
+    ) do |zos|
+      zos.put_next_entry('large.bin')
+      zos << data
+    end
+
+    ::Zip::InputStream.open(buffer) do |input|
+      entry = input.get_next_entry
+      assert_equal 'large.bin', entry.name
+      assert_equal data.bytesize, entry.size
+      assert_equal Zlib.crc32(data), entry.crc
+      assert_equal data, input.read
+    end
+  end
+
   def test_writing_to_closed_stream
     assert_i_o_error_in_closed_stream { |zos| zos << 'hello world' }
     assert_i_o_error_in_closed_stream { |zos| zos.puts 'hello world' }

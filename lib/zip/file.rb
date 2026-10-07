@@ -71,14 +71,24 @@ module Zip
 
     def_delegators :@cdir, :comment, :comment=, :each, :entries, :glob, :size
 
-    # Opens a zip archive. Pass create: true to create
-    # a new archive if it doesn't exist already.
+    # Opens a zip archive. Pass +create: true+ to create a new archive if it
+    # doesn't exist already. Pass +parallel_compression: true+ to compress
+    # large deflated members in chunks; use +deflate_chunk_size+ and
+    # +compression_workers+ to tune chunk size and concurrency, with
+    # +max_pending_chunks+ for backpressure, or pass
+    # +compression_executor:+ for an object responding to +post(&job)+ or
+    # +call(&job)+.
     def initialize(path_or_io, create: false, buffer: false,
                    restore_ownership: DEFAULT_RESTORE_OPTIONS[:restore_ownership],
                    restore_permissions: DEFAULT_RESTORE_OPTIONS[:restore_permissions],
                    restore_times: DEFAULT_RESTORE_OPTIONS[:restore_times],
                    compression_level: ::Zip.default_compression,
-                   suppress_extra_fields: false)
+                   suppress_extra_fields: false,
+                   parallel_compression: false,
+                   deflate_chunk_size: nil,
+                   compression_workers: nil,
+                   compression_executor: nil,
+                   max_pending_chunks: nil)
       super()
 
       @name    = path_or_io.respond_to?(:path) ? path_or_io.path : path_or_io
@@ -91,6 +101,11 @@ module Zip
       @restore_times         = restore_times
       @compression_level     = compression_level
       @suppress_extra_fields = suppress_extra_fields
+      @parallel_compression  = parallel_compression
+      @deflate_chunk_size    = deflate_chunk_size
+      @compression_workers   = compression_workers
+      @compression_executor  = compression_executor
+      @max_pending_chunks    = max_pending_chunks
     end
 
     class << self
@@ -102,13 +117,23 @@ module Zip
                restore_permissions: DEFAULT_RESTORE_OPTIONS[:restore_permissions],
                restore_times: DEFAULT_RESTORE_OPTIONS[:restore_times],
                compression_level: ::Zip.default_compression,
-               suppress_extra_fields: false)
+               suppress_extra_fields: false,
+               parallel_compression: false,
+               deflate_chunk_size: nil,
+               compression_workers: nil,
+               compression_executor: nil,
+               max_pending_chunks: nil)
         zf = ::Zip::File.new(file_name, create:                create,
                                         restore_ownership:     restore_ownership,
                                         restore_permissions:   restore_permissions,
                                         restore_times:         restore_times,
                                         compression_level:     compression_level,
-                                        suppress_extra_fields: suppress_extra_fields)
+                                        suppress_extra_fields: suppress_extra_fields,
+                                        parallel_compression:  parallel_compression,
+                                        deflate_chunk_size:    deflate_chunk_size,
+                                        compression_workers:   compression_workers,
+                                        compression_executor:  compression_executor,
+                                        max_pending_chunks:    max_pending_chunks)
 
         return zf unless block_given?
 
@@ -121,14 +146,22 @@ module Zip
 
       # Like #open, but reads zip archive contents from a String or open IO
       # stream, and outputs data to a buffer.
-      # (This can be used to extract data from a
-      # downloaded zip archive without first saving it to disk.)
+      # It accepts the same +parallel_compression+, +deflate_chunk_size+,
+      # +compression_workers+, +max_pending_chunks+ and
+      # +compression_executor+ options.
+      # (This can be used to extract data from a downloaded zip archive
+      # without first saving it to disk.)
       def open_buffer(io = ::StringIO.new, create: false,
                       restore_ownership: DEFAULT_RESTORE_OPTIONS[:restore_ownership],
                       restore_permissions: DEFAULT_RESTORE_OPTIONS[:restore_permissions],
                       restore_times: DEFAULT_RESTORE_OPTIONS[:restore_times],
                       compression_level: ::Zip.default_compression,
-                      suppress_extra_fields: false)
+                      suppress_extra_fields: false,
+                      parallel_compression: false,
+                      deflate_chunk_size: nil,
+                      compression_workers: nil,
+                      compression_executor: nil,
+                      max_pending_chunks: nil)
         unless IO_METHODS.map { |method| io.respond_to?(method) }.all? || io.kind_of?(String)
           raise 'Zip::File.open_buffer expects a String or IO-like argument' \
                 "(responds to #{IO_METHODS.join(', ')}). Found: #{io.class}"
@@ -141,7 +174,12 @@ module Zip
                                  restore_permissions:   restore_permissions,
                                  restore_times:         restore_times,
                                  compression_level:     compression_level,
-                                 suppress_extra_fields: suppress_extra_fields)
+                                 suppress_extra_fields: suppress_extra_fields,
+                                 parallel_compression:  parallel_compression,
+                                 deflate_chunk_size:    deflate_chunk_size,
+                                 compression_workers:   compression_workers,
+                                 compression_executor:  compression_executor,
+                                 max_pending_chunks:    max_pending_chunks)
 
         return zf unless block_given?
 
@@ -399,7 +437,10 @@ module Zip
       return if name.kind_of?(StringIO) || !commit_required?
 
       on_success_replace do |tmp_file|
-        ::Zip::OutputStream.open(tmp_file, suppress_extra_fields: @suppress_extra_fields) do |zos|
+        ::Zip::OutputStream.open(
+          tmp_file,
+          **compression_options
+        ) do |zos|
           @cdir.each do |e|
             e.write_to_zip_output_stream(zos)
             e.clean_up
@@ -415,7 +456,7 @@ module Zip
     def write_buffer(io = ::StringIO.new)
       return io unless commit_required?
 
-      ::Zip::OutputStream.write_buffer(io, suppress_extra_fields: @suppress_extra_fields) do |zos|
+      ::Zip::OutputStream.write_buffer(io, **compression_options) do |zos|
         @cdir.each { |e| e.write_to_zip_output_stream(zos) }
         zos.comment = comment
       end
@@ -474,6 +515,17 @@ module Zip
     end
 
     private
+
+    def compression_options
+      {
+        suppress_extra_fields: @suppress_extra_fields,
+        parallel_compression:  @parallel_compression,
+        deflate_chunk_size:    @deflate_chunk_size,
+        compression_workers:   @compression_workers,
+        compression_executor:  @compression_executor,
+        max_pending_chunks:    @max_pending_chunks
+      }
+    end
 
     def apply_restore_options(entry)
       entry.restore_ownership   = @restore_ownership
