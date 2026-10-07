@@ -216,7 +216,7 @@ module Zip
         raise ::Zip::CompressionMethodError, @current_entry.compression_method
       end
 
-      decompressor_class.new(io, decompressed_size)
+      decompressor_class.new(io, decompressed_size, @current_entry)
     end
 
     def produce_input(maxlen = CHUNK_SIZE) # :nodoc:
