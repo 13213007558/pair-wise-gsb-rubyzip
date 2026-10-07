@@ -5,6 +5,9 @@ module Zip
   # you don't need to know what sort of error has been raised.
   class Error < StandardError; end
 
+  # Error raised when a zip delta is invalid or cannot be applied safely.
+  class DeltaError < Error; end
+
   # Error raised if an unsupported compression method is used.
   class CompressionMethodError < Error
     # The compression method that has caused this error.
