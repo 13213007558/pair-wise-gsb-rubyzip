@@ -110,6 +110,8 @@ module Zip
 
     # Is this entry encrypted?
     def encrypted?
+      return false if compression_method == COMPRESSION_METHOD_IMPLODE
+
       gp_flags & 1 == 1
     end
 

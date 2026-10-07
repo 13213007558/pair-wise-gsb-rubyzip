@@ -106,7 +106,11 @@ module Zip
       # Remove the default value for maxlen for version 4.
       return (maxlen.nil? || maxlen.zero? ? '' : nil) if eof?
 
-      output = produce_input(maxlen)
+      output = begin
+        produce_input(maxlen)
+      rescue StandardError
+        raise_entry_decompression_error($!)
+      end
 
       if out_string.nil?
         output.force_encoding(@internal_encoding || @external_encoding)
@@ -114,6 +118,14 @@ module Zip
         encoding = out_string.encoding
         out_string.replace(output).force_encoding(encoding)
       end
+    end
+
+    def raise_entry_decompression_error(error)
+      raise error if @current_entry.nil?
+
+      message = "decompression failed for entry '#{@current_entry.name}': #{error.message}"
+      wrapped = DecompressionError.entry_error(message)
+      raise wrapped
     end
 
     # Returns the size of the current entry, or `nil` if there isn't one.
@@ -216,7 +228,10 @@ module Zip
         raise ::Zip::CompressionMethodError, @current_entry.compression_method
       end
 
-      decompressor_class.new(io, decompressed_size)
+      decompressor = decompressor_class.new(io, decompressed_size,
+                                           flags: @current_entry.gp_flags)
+      decompressor.entry_name = @current_entry.name if decompressor.respond_to?(:entry_name=)
+      decompressor
     end
 
     def produce_input(maxlen = CHUNK_SIZE) # :nodoc:
