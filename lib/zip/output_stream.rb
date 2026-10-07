@@ -29,7 +29,15 @@ module Zip
 
     # Opens the indicated zip file. If a file with that name already
     # exists it will be overwritten.
-    def initialize(file_name, stream: false, encrypter: nil, suppress_extra_fields: false, **opts)
+    #
+    # Set <tt>parallel_compression: true</tt> to compress each DEFLATED
+    # entry in independent chunks using Zip::ParallelDeflater, which can
+    # speed up writing archives that contain a single large entry. Pass a
+    # hash of Zip::ParallelDeflater options instead of +true+ to configure
+    # it, e.g. <tt>{executor: Zip::ParallelDeflater::ThreadPoolExecutor.new}</tt>
+    # for real parallelism (the default executor is single-threaded).
+    def initialize(file_name, stream: false, encrypter: nil, suppress_extra_fields: false,
+                   parallel_compression: nil, **opts)
       super(**opts)
       @file_name = file_name
       @output_stream = if stream
@@ -44,6 +52,7 @@ module Zip
       @compressor = ::Zip::NullCompressor.instance
       @encrypter = encrypter || ::Zip::NullEncrypter.new
       @suppress_extra_fields = suppress_extra_fields
+      @parallel_compression = parallel_compression
       @closed = false
       @current_entry = nil
     end
@@ -191,7 +200,13 @@ module Zip
     def get_compressor(entry)
       case entry.compression_method
       when Entry::DEFLATED
-        ::Zip::Deflater.new(@output_stream, entry.compression_level, @encrypter)
+        if @parallel_compression
+          options = @parallel_compression.is_a?(Hash) ? @parallel_compression : {}
+          ::Zip::ParallelDeflater.new(@output_stream, entry.compression_level, @encrypter,
+                                      **options)
+        else
+          ::Zip::Deflater.new(@output_stream, entry.compression_level, @encrypter)
+        end
       when Entry::STORED
         ::Zip::PassThruCompressor.new(@output_stream, @encrypter)
       else
